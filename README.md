@@ -1,103 +1,99 @@
-# Moore WeChat Article Downloader
+# Moore 微信公众号文章下载器
 
-微信公众号文章下载工具，支持三种模式：直接下载、账号历史抓取、Exporter API 导出。
+用自然语言驱动的微信公众号文章下载 Skill，说一句话完成下载、整理和同步。
 
-## 功能概览
+## 亮点
 
-| 模式 | 适用场景 | 核心依赖 |
-|------|----------|----------|
-| **直接下载** | 已有文章 URL 或 URL 列表 | Python 3 标准库 |
-| **账号历史** | 抓取某个公众号历史文章列表 | mitmproxy |
-| **Exporter** | 通过 API 搜索账号、批量同步文章 | Python 3 标准库 |
+- **说话即操作** — 直接告诉 AI 你想做什么，无需记命令参数
+- **输出干净可用** — 自动转 Markdown、下载配图、生成 `index.csv`，开箱即用
+- **按公众号整理** — 下载结果存入 `~/Downloads/wechat-articles/〈公众号名〉/`，一目了然
+- **纯 Python 标准库** — 无需 `pip install`，Python 3.10+ 即可运行
+- **内置防封节奏控制** — Token bucket 限速 + 随机间隔，大批量下载更安全
+- **一次登录四天有效** — 凭证存入 macOS Keychain，无需反复扫码
+
+## 你可以这样说
+
+**下载单篇或一批文章**
+
+> 「下载这篇文章 https://mp.weixin.qq.com/s/xxx」  
+> 「帮我下载这几篇：https://... https://... https://...」  
+> 「把 urls.txt 里的文章全部下载成 Markdown」
+
+**获取某个公众号的历史文章**（需有微信公众号账号，扫码登录）
+
+> 「下载公众号〈AI干货〉最新 20 篇文章」  
+> 「把〈出海日记〉这个公众号的文章整理出来，我来选」
+
+**订阅多个账号，定期同步**（同上，需扫码登录）
+
+> 「帮我订阅〈效率工具〉和〈独立开发者〉这两个公众号」  
+> 「同步所有订阅账号的新文章并下载」  
+> 「设置每天早上自动同步一次」
+
+**没有公众号？用代理模式手动抓取**
+
+> 「用代理模式抓取〈科技资讯〉公众号的历史文章，我不想登录」
+
+## 两种主要模式详解
+
+### Exporter 模式（默认，需要有微信公众号账号）
+
+> 需要你拥有并已认证的微信公众号或服务号，用于扫码登录微信公众平台。
+
+1. 告诉 AI 你要下载哪个公众号
+2. **首次使用**：AI 自动生成二维码 → 用手机微信扫码 → 在微信里选择你的公众号/服务号确认登录
+3. AI 自动搜索目标公众号、同步文章列表
+4. 如果搜到多个同名账号，AI 列出候选让你选一个
+5. AI 列出文章标题 + 日期，你选想下载哪些（或直接说"最新 20 篇"）
+6. 下载完成，存入 `~/Downloads/wechat-articles/〈公众号名〉/`
+
+登录凭证有效 4 天，期间不用重复扫码。
+
+---
+
+### 代理模式（无需账号，需在电脑上操作）
+
+> 不需要任何账号。原理：本地启动代理，拦截你在微信里正常浏览历史文章时的网络请求，静默提取文章列表。
+
+1. 告诉 AI 你要用代理模式，并提供该公众号的任意一篇文章链接
+2. AI 检查本机是否安装了 mitmproxy，未安装时提示先安装
+3. AI 启动本地代理（8899 端口），并生成一个旧版公众号历史页链接
+4. 把这个链接发到微信文件传输助手，用**微信桌面客户端的内置浏览器**打开（不是系统浏览器）
+5. 在微信内置浏览器里向下滚动历史文章列表，每次滚动约加载 10 条，滚完你想要的范围后告诉 AI
+6. AI 列出已捕获的文章，你选择下载哪些
+7. 下载完成
+
+**注意事项：**
+- 需要安装 mitmproxy 并信任其根证书（用于解密 HTTPS 流量）
+- 只能抓到你实际滚过的文章，建议耐心滚完目标范围
+- 切换公众号时无需重启代理，直接换链接继续
 
 ## 输出格式
 
-每次下载结果保存至 `~/Downloads/wechat-articles/`：
-
 ```
 ~/Downloads/wechat-articles/
-└── <run-id>/
-    ├── index.csv             # 文章元数据索引
+└── 〈公众号名〉/
+    ├── index.csv          ← 所有文章的元数据索引
     ├── articles/
-    │   └── <seq>-<title>.md  # Markdown 正文
+    │   └── 001-标题.md    ← 正文 Markdown
     └── images/
-        └── <seq>/            # 文章配图
+        └── 001/           ← 文章配图
 ```
 
-## 快速开始
-
-### 直接下载单篇文章
+## 安装
 
 ```bash
-python3 scripts/wechat_wizard.py run "帮我下载这篇文章 https://mp.weixin.qq.com/s/xxx"
-```
+# 无额外依赖，Python 3.10+ 即可
+python3 --version
 
-### 批量下载（URL 列表文件）
-
-```bash
-python3 scripts/wechat_wizard.py run "批量下载 urls.txt 里的文章"
-```
-
-### 账号历史文章抓取
-
-需先安装 mitmproxy：
-
-```bash
+# 仅代理抓取模式需要
 pip install mitmproxy
 ```
 
-然后：
-
-```bash
-python3 scripts/wechat_wizard.py run "抓取这个公众号的历史文章 https://mp.weixin.qq.com/s/xxx"
-```
-
-Wizard 会启动本地代理（端口 8899），在手机微信中打开文章列表页，流量会被自动捕获。
-
-### Exporter 模式（搜索 + 批量同步）
-
-```bash
-python3 scripts/wechat_wizard.py run "登录 Exporter 并导出「财经」相关公众号的文章"
-```
-
-首次使用需扫码登录，凭证存储于 macOS Keychain（降级时存 SQLite）。
-
-## 内部状态存储
-
-工具状态存储于 `~/.moore/wechat-article-downloader/`（不影响用户输出目录）：
-
-```
-~/.moore/wechat-article-downloader/
-├── context/<session-id>.json          # 会话元数据
-├── runs/<run-id>/manifest.json        # 下载任务记录
-├── exporter.sqlite                    # 账号与文章数据库
-└── account-history/<account-id>/      # 历史抓取缓存
-```
-
-## 架构说明
-
-```
-wechat_wizard.py          ← 用户意图路由 & 交互流程
-    ├── wechat_downloader.py          ← URL 下载 / 历史代理模式
-    ├── wechat_exporter.py            ← Exporter API 模式
-    └── wechat_history_mitm_addon.py  ← mitmproxy 流量捕获插件
-```
-
-- **Wizard** 解析用户意图，判断所需 gate（登录态、代理确认、选择操作），再调用对应后端脚本。
-- **Downloader** 验证 `mp.weixin.qq.com` URL，提取 HTML 正文，转换为 Markdown，下载图片。
-- **Exporter** 通过认证 API 搜索公众号、同步文章列表、按需下载，账号数据持久化至 SQLite。
-- **MITM Addon** 作为 mitmproxy 插件运行，捕获微信 `getmsg` 接口响应，生成文章 CSV/JSON 索引。
-
-## 系统要求
-
-- Python 3.10+（无第三方依赖，标准库即可）
-- mitmproxy（仅账号历史模式需要）
-- macOS（Keychain 凭证存储；其他平台降级为 SQLite 存储）
-
 ## 参考文档
 
-- [`references/backend-design.md`](references/backend-design.md) — 三层架构设计
-- [`references/output-formats.md`](references/output-formats.md) — 输出文件格式规范
-- [`references/compliance.md`](references/compliance.md) — 安全与权限说明
+- [`SKILL.md`](SKILL.md) — 意图路由与场景定义
+- [`references/backend-design.md`](references/backend-design.md) — 架构设计
+- [`references/output-formats.md`](references/output-formats.md) — 输出格式规范
 - [`references/troubleshooting.md`](references/troubleshooting.md) — 常见问题排查
-- [`SKILL.md`](SKILL.md) — Skill 意图路由定义
+- [`references/compliance.md`](references/compliance.md) — 安全与权限说明
