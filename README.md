@@ -97,3 +97,7 @@ pip install mitmproxy
 - [`references/output-formats.md`](references/output-formats.md) — 输出格式规范
 - [`references/troubleshooting.md`](references/troubleshooting.md) — 常见问题排查
 - [`references/compliance.md`](references/compliance.md) — 安全与权限说明
+
+## License
+
+MIT. See [`LICENSE`](LICENSE).
