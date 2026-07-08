@@ -26,6 +26,8 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import random
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -77,6 +79,68 @@ WECHAT_HISTORY_USER_AGENT = (
     "MicroMessenger/8.0.49 NetType/WIFI Language/zh_CN"
 )
 WECHAT_RADIUM_DIR = Path.home() / "Library" / "Containers" / "com.tencent.xinWeChat" / "Data" / "Documents" / "app_data" / "radium"
+
+
+
+class DownloadThrottle:
+    """Token bucket rate limiter with adaptive concurrency and jitter."""
+
+    # conservative defaults: 20 req/min, burst of 3, 0.8–2.0s inter-article delay
+    def __init__(
+        self,
+        req_per_min: int = 20,
+        burst: int = 3,
+        inter_delay: tuple[float, float] = (0.8, 2.0),
+        init_workers: int = 2,
+        max_workers: int = 4,
+    ) -> None:
+        self._rate = req_per_min / 60.0
+        self._tokens = float(burst)
+        self._max_tokens = float(burst)
+        self._last_refill = time.monotonic()
+        self._lock = threading.Lock()
+        self._inter_delay = inter_delay
+        self._success_streak = 0
+        self.current_workers = init_workers
+        self._max_workers = max_workers
+
+    def _refill(self) -> None:
+        now = time.monotonic()
+        self._tokens = min(self._max_tokens, self._tokens + (now - self._last_refill) * self._rate)
+        self._last_refill = now
+
+    def acquire(self) -> None:
+        """Block until a token is available."""
+        while True:
+            with self._lock:
+                self._refill()
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+                wait = (1.0 - self._tokens) / self._rate
+            time.sleep(wait)
+
+    def inter_sleep(self) -> None:
+        time.sleep(random.uniform(*self._inter_delay))
+
+    def on_success(self) -> None:
+        with self._lock:
+            self._success_streak += 1
+            if self._success_streak >= 10 and self.current_workers < self._max_workers:
+                self.current_workers += 1
+                self._success_streak = 0
+
+    def on_rate_error(self) -> None:
+        """Call on 429 / connection-reset; backs off and reduces concurrency."""
+        with self._lock:
+            self._success_streak = 0
+            if self.current_workers > 1:
+                self.current_workers -= 1
+        time.sleep(30)
+
+    @staticmethod
+    def backoff_sleep(attempt: int) -> None:
+        time.sleep(min(60.0, 2 ** attempt + random.uniform(0.0, 1.0)))
 
 
 class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -358,18 +422,14 @@ def fixture_html_path(url: str) -> Path | None:
     return None
 
 
-def fetch_text(url: str, timeout: int = 20) -> str:
+def fetch_text(url: str, timeout: int = 20, ua: str | None = None) -> str:
     fixture = fixture_html_path(url)
     if fixture:
         return fixture.read_text(encoding="utf-8")
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/126.0 Safari/537.36"
-            ),
+            "User-Agent": ua or WECHAT_HISTORY_USER_AGENT,
             "Referer": "https://mp.weixin.qq.com/",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         },
@@ -2313,27 +2373,48 @@ def run_markdown_only_download(
     run_id: str | None = None,
     html_concurrency: int = 1,
     max_retries: int = 0,
+    req_per_min: int = 20,
+    aggressive: bool = False,
 ) -> dict[str, Any]:
     run_id = run_id or make_run_id()
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "articles").mkdir(parents=True, exist_ok=True)
     (output_dir / "images").mkdir(parents=True, exist_ok=True)
-    worker_count = max(1, min(int(html_concurrency or 1), 4))
     retry_limit = max(0, min(int(max_retries or 0), 3))
+
+    if aggressive:
+        throttle = DownloadThrottle(req_per_min=req_per_min or 30, burst=5, inter_delay=(0.5, 1.2), init_workers=3, max_workers=5)
+    else:
+        throttle = DownloadThrottle(req_per_min=req_per_min or 20, burst=3, inter_delay=(0.8, 2.0), init_workers=2, max_workers=4)
+
+    # html_concurrency overrides throttle's init if explicitly > 1
+    if html_concurrency and html_concurrency > 1:
+        throttle.current_workers = max(1, min(int(html_concurrency), throttle._max_workers))
 
     def download_at(index: int, url: str) -> tuple[int, dict[str, Any], bool]:
         seq = seq_name(index)
         last_error = ""
         for attempt in range(retry_limit + 1):
+            throttle.acquire()
             try:
                 article = download_one_markdown_only(url, output_dir, seq, download_assets)
                 if attempt:
                     article["retry_attempts"] = attempt
+                throttle.on_success()
+                throttle.inter_sleep()
                 return index, article, True
+            except urllib.error.HTTPError as exc:
+                last_error = sanitize_text_urls(str(exc))
+                is_rate = exc.code in (429, 503)
+                if attempt < retry_limit:
+                    if is_rate:
+                        throttle.on_rate_error()
+                    else:
+                        DownloadThrottle.backoff_sleep(attempt)
             except Exception as exc:
                 last_error = sanitize_text_urls(str(exc))
                 if attempt < retry_limit:
-                    time.sleep(0.5 * (attempt + 1))
+                    DownloadThrottle.backoff_sleep(attempt)
         return index, {
             "seq": seq,
             "article_id": "",
@@ -2349,6 +2430,7 @@ def run_markdown_only_download(
         }, False
 
     results: list[tuple[int, dict[str, Any], bool]] = []
+    worker_count = throttle.current_workers
     if worker_count == 1 or len(urls) <= 1:
         results = [download_at(index, url) for index, url in enumerate(urls, 1)]
     else:
@@ -2378,7 +2460,7 @@ def run_markdown_only_download(
         "index": str(output_dir / "index.csv"),
         "success_count": len(articles),
         "failure_count": len(failed),
-        "html_concurrency": worker_count,
+        "html_concurrency": throttle.current_workers,
         "max_retries": retry_limit,
         "retry_attempt_count": sum(int(item.get("retry_attempts") or 0) for item in rows),
         "articles": articles,
@@ -2393,6 +2475,8 @@ def run_download(
     formats: set[str],
     download_assets: bool,
     input_payload: dict[str, Any],
+    req_per_min: int = 20,
+    aggressive: bool = False,
 ) -> dict[str, Any]:
     ensure_runtime(base)
     run_id = make_run_id()
@@ -2400,11 +2484,23 @@ def run_download(
     run_dir.mkdir(parents=True, exist_ok=True)
     write_json(run_dir / "input.json", scrub_payload(input_payload))
 
+    if aggressive:
+        throttle = DownloadThrottle(req_per_min=req_per_min or 30, burst=5, inter_delay=(0.5, 1.2), init_workers=1, max_workers=1)
+    else:
+        throttle = DownloadThrottle(req_per_min=req_per_min or 20, burst=3, inter_delay=(0.8, 2.0), init_workers=1, max_workers=1)
+
     articles: list[dict[str, Any]] = []
     failed: list[dict[str, str]] = []
     for url in urls:
+        throttle.acquire()
         try:
             articles.append(download_one(url, base, formats, download_assets))
+            throttle.on_success()
+            throttle.inter_sleep()
+        except urllib.error.HTTPError as exc:
+            failed.append({"url": safe_display_url(url), "error": sanitize_text_urls(str(exc))})
+            if exc.code in (429, 503):
+                throttle.on_rate_error()
         except Exception as exc:
             failed.append({"url": safe_display_url(url), "error": sanitize_text_urls(str(exc))})
 
@@ -2491,10 +2587,12 @@ def print_download_summary(manifest: dict[str, Any]) -> None:
 
 def run_download_for_args(urls: list[str], args: argparse.Namespace, input_payload: dict[str, Any]) -> dict[str, Any]:
     profile = getattr(args, "profile", "markdown-only")
+    req_per_min = getattr(args, "req_per_min", 20)
+    aggressive = getattr(args, "aggressive", False)
     if profile == "archive":
         base = runtime_dir(args.runtime_dir)
         formats = parse_formats(args.formats)
-        return run_download(urls, base, formats, not args.no_assets, {**input_payload, "profile": profile, "formats": sorted(formats)})
+        return run_download(urls, base, formats, not args.no_assets, {**input_payload, "profile": profile, "formats": sorted(formats)}, req_per_min, aggressive)
     run_id = make_run_id()
     out_dir = delivery_dir(getattr(args, "output_dir", ""), run_id)
     return run_markdown_only_download(
@@ -2505,6 +2603,8 @@ def run_download_for_args(urls: list[str], args: argparse.Namespace, input_paylo
         run_id,
         getattr(args, "html_concurrency", 1),
         getattr(args, "max_retries", 0),
+        req_per_min,
+        aggressive,
     )
 
 
@@ -2977,6 +3077,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-assets", action="store_true")
     p.add_argument("--html-concurrency", type=int, default=1, help="Markdown-only article fetch concurrency, capped at 4")
     p.add_argument("--max-retries", type=int, default=0, help="Markdown-only per-article retry count, capped at 3")
+    p.add_argument("--req-per-min", type=int, default=20, help="Token bucket rate limit in requests/minute (default 20)")
+    p.add_argument("--aggressive", action="store_true", help="Higher concurrency and shorter delays (30 req/min, workers up to 5)")
     p.set_defaults(func=command_download_url)
 
     p = sub.add_parser("download-list", help="Download URLs from text, .txt, .csv, or .json")
@@ -2988,6 +3090,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-assets", action="store_true")
     p.add_argument("--html-concurrency", type=int, default=1, help="Markdown-only article fetch concurrency, capped at 4")
     p.add_argument("--max-retries", type=int, default=0, help="Markdown-only per-article retry count, capped at 3")
+    p.add_argument("--req-per-min", type=int, default=20, help="Token bucket rate limit in requests/minute (default 20)")
+    p.add_argument("--aggressive", action="store_true", help="Higher concurrency and shorter delays (30 req/min, workers up to 5)")
     p.set_defaults(func=command_download_list)
 
     p = sub.add_parser("list", help="List downloaded articles")
