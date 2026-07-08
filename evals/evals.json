@@ -1,0 +1,59 @@
+{
+  "skill_name": "moore-wechat-article-downloader",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "帮我下载这篇公众号文章，只要 Markdown 和图片：https://mp.weixin.qq.com/s/example",
+      "expected_output": "优先调用 scripts/wechat_wizard.py run 进入 URL 模式，执行输入、模式、环境、下载、验证门禁；输出到 ~/Downloads/wechat-articles/<run-id>/ 或用户指定目录，包含 index.csv、articles.json、errors.json、run.json、articles/*.md、images/<seq>/。",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "把这个 txt 文件里的公众号链接批量下载，失败的单独列出来。",
+      "expected_output": "优先调用 scripts/wechat_wizard.py run 进入 URL 批量模式，说明支持 txt/csv/json/pasted URLs，输出 index.csv、articles/、images/、articles.json、errors.json、run.json，失败行写入 index.csv 的 status/error。",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "我粘贴了 3 个公众号文章 URL，请通过 Skill 直接批量下载，不要打开 Dashboard。",
+      "expected_output": "使用 scripts/wechat_wizard.py run 完成批量下载，不启动 serve/Dashboard，并返回 task_id、output_dir、index.csv、成功/失败数量。",
+      "files": []
+    },
+    {
+      "id": 4,
+      "prompt": "我想下载某个公众号的历史文章，这是其中一篇样例文章：https://mp.weixin.qq.com/s/example",
+      "expected_output": "优先调用 scripts/wechat_wizard.py run 进入 history 模式，生成旧版 profile_ext?action=home 历史入口并停在 need_proxy_confirm；只有用户确认后才用 history-proxy-setup / history-proxy-start / history-proxy-enable 处理 mitmproxy 和系统代理；结束后必须 history-proxy-stop 和 history-proxy-disable --yes 恢复代理。",
+      "files": []
+    },
+    {
+      "id": 5,
+      "prompt": "历史文章列表出来后，先把编号摘要给我看，然后我选 1-20 或 1,3,5 这种格式下载。",
+      "expected_output": "使用 history-preview 展示日期、标题和编号，不只给 CSV/JSON 路径；按用户选择调用 history-select --range / --contains / --titles / --latest 生成 selected_articles.csv，再使用 history-download-selected 默认 markdown-only 下载。",
+      "files": []
+    },
+    {
+      "id": 6,
+      "prompt": "我已经有微信公众号后台了，想用 exporter 模式扫码登录，搜索公众号，添加后同步文章和合集，然后选择下载。",
+      "expected_output": "优先调用 scripts/wechat_wizard.py run；未登录时返回 need_login 和二维码信息，再用 login-status / login-complete 轮询并恢复父任务；公众号或文章需要选择时用 scripts/wechat_wizard.py resume <task-id> --choice \"<序号/范围/关键词>\"；复杂管理才降级 exporter-search/exporter-add/exporter-collections。",
+      "files": []
+    },
+    {
+      "id": 7,
+      "prompt": "用 exporter 模式下载公众号「哥飞」最新 20 篇，别让我一步步输命令。",
+      "expected_output": "优先调用 scripts/wechat_wizard.py run 自动检查本地账号缓存、登录状态、同步新鲜度并下载最新 20 篇；如登录缺失返回 need_login 并用 login-status/login-complete 恢复，如公众号候选不唯一返回 need_account_choice 并用 resume 选择，如用户要求先看列表则返回文章标题/日期后等待选择。",
+      "files": []
+    },
+    {
+      "id": 8,
+      "prompt": "下载这几篇公众号文章：https://mp.weixin.qq.com/s/a https://mp.weixin.qq.com/s/b，自动去重并给我 Markdown 输出目录。",
+      "expected_output": "优先调用 scripts/wechat_wizard.py run 进入统一 URL wizard；执行输入、模式、环境、下载、验证门禁；输出 task_id、run_id、output_dir、index.csv、articles.json、errors.json、run.json、成功/失败数量。",
+      "files": []
+    },
+    {
+      "id": 9,
+      "prompt": "刚才这个批量任务有几篇失败了，帮我只重试失败项；已经成功的不要重复下。",
+      "expected_output": "使用 scripts/wechat_wizard.py retry <task-id> 读取 SQLite download_items 中仍未成功的 failed URL；同 task 重跑默认跳过已 success 的 URL，只有用户明确要求才加 --force。",
+      "files": []
+    }
+  ]
+}

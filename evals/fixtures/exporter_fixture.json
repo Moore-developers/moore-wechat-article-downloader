@@ -1,0 +1,47 @@
+{
+  "account": {
+    "fakeid": "fakeid_gefei_demo",
+    "nickname": "哥飞",
+    "alias": "gefei7",
+    "round_head_img": "https://mmbiz.qpic.cn/demo/avatar.jpg",
+    "signature": "AI 工具与出海实践"
+  },
+  "articles": [
+    {
+      "aid": "1001",
+      "appmsgid": "9001",
+      "itemidx": 1,
+      "title": "AI 工具出海实战",
+      "author_name": "哥飞",
+      "digest": "一篇关于 AI 工具增长的文章",
+      "link": "https://mp.weixin.qq.com/s/demo-exporter-article-1",
+      "cover": "https://mmbiz.qpic.cn/demo/cover1.jpg",
+      "update_time": 1783260000,
+      "album_title": "AI"
+    },
+    {
+      "aid": "1002",
+      "appmsgid": "9002",
+      "itemidx": 1,
+      "title": "公众号运营专家入门",
+      "author_name": "哥飞",
+      "digest": "一篇关于公众号运营的文章",
+      "link": "https://mp.weixin.qq.com/s/demo-exporter-article-2",
+      "cover": "https://mmbiz.qpic.cn/demo/cover2.jpg",
+      "update_time": 1783173600,
+      "album_title": "运营"
+    },
+    {
+      "aid": "1003",
+      "appmsgid": "9003",
+      "itemidx": 1,
+      "title": "Agent 工作流已经开始",
+      "author_name": "哥飞",
+      "digest": "一篇关于智能体工作流的文章",
+      "link": "https://mp.weixin.qq.com/s/demo-exporter-article-3",
+      "cover": "https://mmbiz.qpic.cn/demo/cover3.jpg",
+      "update_time": 1783087200,
+      "album_title": "AI"
+    }
+  ]
+}
