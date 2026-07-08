@@ -2178,6 +2178,64 @@ def command_sync(args: argparse.Namespace) -> int:
     return 0
 
 
+def sync_all_accounts(base: Path, per_account_limit: int = 50) -> dict[str, Any]:
+    accounts = list_accounts(base)
+    if not accounts:
+        return {"ok": True, "accounts_synced": 0, "results": []}
+    results = []
+    for account in accounts:
+        result = sync_account_articles(base, int(account["id"]), per_account_limit)
+        results.append({
+            "account_id": account["id"],
+            "nickname": account["nickname"],
+            "ok": result.get("ok", False),
+            "inserted": result.get("inserted", 0),
+            "error": result.get("error", ""),
+        })
+    ok_count = sum(1 for r in results if r["ok"])
+    return {
+        "ok": ok_count == len(results),
+        "accounts_synced": ok_count,
+        "accounts_failed": len(results) - ok_count,
+        "results": results,
+    }
+
+
+def download_new_articles(base: Path, output_dir: str = "", no_assets: bool = False) -> dict[str, Any]:
+    rows = list_articles(base, account_id=0, limit=5000, downloaded="no")
+    if not rows:
+        return {"ok": True, "message": "no new articles to download", "success_count": 0, "failure_count": 0}
+    ids = [int(row["id"]) for row in rows]
+    return download_articles(base, ids, output_dir, no_assets)
+
+
+def daily_run(base: Path, per_account_limit: int = 50, output_dir: str = "", no_assets: bool = False) -> dict[str, Any]:
+    sync_result = sync_all_accounts(base, per_account_limit)
+    download_result = download_new_articles(base, output_dir, no_assets)
+    return {
+        "ok": sync_result["ok"] and download_result.get("ok", True),
+        "sync": sync_result,
+        "download": download_result,
+    }
+
+
+def command_sync_all(args: argparse.Namespace) -> int:
+    write_json_response(sync_all_accounts(runtime_dir(args.runtime_dir), args.per_account_limit))
+    return 0
+
+
+def command_download_new(args: argparse.Namespace) -> int:
+    result = download_new_articles(runtime_dir(args.runtime_dir), args.output_dir, args.no_assets)
+    write_json_response(result)
+    return 0 if result.get("ok") else 1
+
+
+def command_daily_run(args: argparse.Namespace) -> int:
+    result = daily_run(runtime_dir(args.runtime_dir), args.per_account_limit, args.output_dir, args.no_assets)
+    write_json_response(result)
+    return 0 if result.get("ok") else 1
+
+
 def command_articles(args: argparse.Namespace) -> int:
     rows = list_articles(runtime_dir(args.runtime_dir), args.account_id, args.limit, args.keyword, args.collection_id, args.downloaded)
     write_json_response({"ok": True, "count": len(rows), "articles": rows})
@@ -2879,6 +2937,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--keyword", default="")
     p.add_argument("--profile", default="")
     p.set_defaults(func=command_sync)
+
+    p = sub.add_parser("exporter-sync-all")
+    p.add_argument("--runtime-dir", default=argparse.SUPPRESS)
+    p.add_argument("--per-account-limit", type=int, default=50)
+    p.set_defaults(func=command_sync_all)
+
+    p = sub.add_parser("exporter-download-new")
+    p.add_argument("--runtime-dir", default=argparse.SUPPRESS)
+    p.add_argument("--output-dir", default="")
+    p.add_argument("--no-assets", action="store_true")
+    p.set_defaults(func=command_download_new)
+
+    p = sub.add_parser("exporter-daily-run")
+    p.add_argument("--runtime-dir", default=argparse.SUPPRESS)
+    p.add_argument("--per-account-limit", type=int, default=50)
+    p.add_argument("--output-dir", default="")
+    p.add_argument("--no-assets", action="store_true")
+    p.set_defaults(func=command_daily_run)
 
     p = sub.add_parser("exporter-articles")
     p.add_argument("--runtime-dir", default=argparse.SUPPRESS)
