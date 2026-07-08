@@ -1300,18 +1300,29 @@ def select_article_ids(
     return [int(row["id"]) for row in rows]
 
 
+def _safe_dir_name(name: str) -> str:
+    safe = re.sub(r'[/\\:*?"<>|]', "_", name).strip()
+    return safe or "account"
+
+
 def download_articles(
     base: Path,
     article_ids: list[int],
     output_dir: str = "",
     no_assets: bool = False,
+    account_nickname: str = "",
 ) -> dict[str, Any]:
     pairs = get_article_urls(base, article_ids)
     if not pairs:
         raise RuntimeError("no articles selected")
     urls = [url for _article_id, url in pairs]
     run_id = make_run_id()
-    out_dir = delivery_dir(output_dir, run_id) if output_dir else (DEFAULT_DELIVERY_DIR / run_id).expanduser().resolve()
+    if output_dir:
+        out_dir = delivery_dir(output_dir, run_id)
+    elif account_nickname:
+        out_dir = (DEFAULT_DELIVERY_DIR / _safe_dir_name(account_nickname)).expanduser().resolve()
+    else:
+        out_dir = (DEFAULT_DELIVERY_DIR / run_id).expanduser().resolve()
     manifest = run_markdown_only_download(
         urls,
         out_dir,

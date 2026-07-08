@@ -1651,7 +1651,8 @@ def run_exporter_mode(base: Path, task_id: str, intent: dict[str, Any], output_d
         save_task(base, task_id, intent, "ready", "exporter", result=result)
         return result
 
-    downloaded = wechat_exporter.download_articles(base, selected_ids, output_dir_arg, no_assets)
+    nickname = account.get("nickname", "") if not output_dir_arg else ""
+    downloaded = wechat_exporter.download_articles(base, selected_ids, output_dir_arg, no_assets, nickname)
     result = {
         "ok": downloaded.get("ok", False),
         "state": "done" if downloaded.get("ok") else "failed_recoverable",
@@ -1883,7 +1884,8 @@ def resume_article_choice(
         }
         save_task(base, task_id, task["intent"], "ready", "exporter", result=result)
         return result
-    downloaded = wechat_exporter.download_articles(base, selected_ids, output_dir, no_assets)
+    nickname = str(account.get("nickname", "")) if not output_dir else ""
+    downloaded = wechat_exporter.download_articles(base, selected_ids, output_dir, no_assets, nickname)
     state = "done" if downloaded.get("ok") else "failed_recoverable"
     manifest = exporter_download_manifest(base, selected_ids, downloaded)
     record_download_manifest(base, task_id, "exporter", manifest, state)
