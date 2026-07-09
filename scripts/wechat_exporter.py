@@ -1587,6 +1587,78 @@ def import_comments(base: Path, path_or_json: str) -> dict[str, Any]:
     return {"ok": True, "inserted_count": inserted, "missing_count": missing}
 
 
+def flush_captured_comments(base: Path) -> dict[str, Any]:
+    capture_dir = base / "comments-capture"
+    if not capture_dir.exists():
+        return {"ok": True, "files_processed": 0, "inserted": 0, "missing_articles": 0, "errors": []}
+    imported_dir = capture_dir / "imported"
+    imported_dir.mkdir(parents=True, exist_ok=True)
+    init_exporter_db(base)
+    db = connect_db(base)
+    files_processed = 0
+    total_inserted = 0
+    total_missing = 0
+    files_skipped = 0
+    errors: list[str] = []
+    try:
+        for path in sorted(capture_dir.glob("*.json")):
+            appmsgid = path.stem
+            try:
+                comments = json.loads(path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                errors.append(f"{path.name}: {exc}")
+                continue
+            if not isinstance(comments, list):
+                continue
+            row = db.execute("SELECT id FROM articles WHERE msgid = ?", (appmsgid,)).fetchone()
+            if not row:
+                total_missing += len(comments)
+                files_skipped += 1
+                continue
+            article_id = int(row["id"])
+            inserted = 0
+            for c in comments:
+                if not isinstance(c, dict):
+                    continue
+                try:
+                    db.execute(
+                        """
+                        INSERT OR IGNORE INTO article_comments
+                            (article_id, comment_id, nick_name, content, like_count, create_time, raw_json, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            article_id,
+                            str(c.get("comment_id") or ""),
+                            str(c.get("nick_name") or ""),
+                            str(c.get("content") or ""),
+                            maybe_int(c.get("like_count")),
+                            parse_time(c.get("create_time")),
+                            json_dumps(c),
+                            utc_now(),
+                        ),
+                    )
+                    inserted += 1
+                except Exception as exc:
+                    errors.append(f"{path.name} comment insert: {exc}")
+            if inserted > 0:
+                db.execute("UPDATE articles SET comment_downloaded = 1, updated_at = ? WHERE id = ?", (utc_now(), article_id))
+            db.commit()
+            total_inserted += inserted
+            files_processed += 1
+            shutil.move(str(path), str(imported_dir / path.name))
+    finally:
+        db.close()
+    return {
+        "ok": True,
+        "files_processed": files_processed,
+        "files_skipped": files_skipped,
+        "inserted": total_inserted,
+        "missing_articles": total_missing,
+        "errors": errors,
+    }
+
+
 def list_comments(base: Path, article_id: int, limit: int = 100) -> list[dict[str, Any]]:
     init_exporter_db(base)
     db = connect_db(base)
@@ -2319,6 +2391,11 @@ def command_comments_import(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_comments_flush(args: argparse.Namespace) -> int:
+    write_json_response(flush_captured_comments(runtime_dir(args.runtime_dir)))
+    return 0
+
+
 def command_comments(args: argparse.Namespace) -> int:
     rows = list_comments(runtime_dir(args.runtime_dir), args.article_id, args.limit)
     write_json_response({"ok": True, "count": len(rows), "comments": rows})
@@ -3034,6 +3111,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--runtime-dir", default=argparse.SUPPRESS)
     p.add_argument("input", help="JSON/CSV path or JSON text with article_id/url and comment content")
     p.set_defaults(func=command_comments_import)
+
+    p = sub.add_parser("exporter-comments-flush")
+    p.add_argument("--runtime-dir", default=argparse.SUPPRESS)
+    p.set_defaults(func=command_comments_flush)
 
     p = sub.add_parser("exporter-comments")
     p.add_argument("--runtime-dir", default=argparse.SUPPRESS)

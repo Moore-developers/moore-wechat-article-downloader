@@ -504,6 +504,21 @@ def extract_meta(raw_html: str, url: str) -> dict[str, str]:
         raw_html,
     ) or url
 
+    read_count = first_regex(
+        [
+            r'var\s+appmsg_read_num\s*=\s*["\']?(\d+)["\']?',
+            r'var\s+read_num\s*=\s*["\']?(\d+)["\']?',
+        ],
+        raw_html,
+    )
+    like_count = first_regex(
+        [
+            r'var\s+appmsg_like_num\s*=\s*["\']?(\d+)["\']?',
+            r'var\s+like_num\s*=\s*["\']?(\d+)["\']?',
+        ],
+        raw_html,
+    )
+
     return {
         "title": title,
         "account": account,
@@ -511,6 +526,8 @@ def extract_meta(raw_html: str, url: str) -> dict[str, str]:
         "publish_time": publish_time,
         "source_url": url,
         "canonical_url": canonical_url,
+        "read_count": read_count,
+        "like_count": like_count,
     }
 
 
@@ -2304,6 +2321,8 @@ def markdown_frontmatter(meta: dict[str, Any], seq: str, image_dir: str) -> str:
         "source_url": meta.get("source_url", ""),
         "downloaded_at": meta.get("downloaded_at", ""),
         "image_dir": image_dir,
+        "read_count": meta.get("read_count", ""),
+        "like_count": meta.get("like_count", ""),
     }
     lines = ["---"]
     for key, value in fields.items():
@@ -2348,6 +2367,8 @@ def download_one_markdown_only(url: str, output_dir: Path, seq: str, download_as
         "markdown_path": article_rel,
         "image_dir": image_rel,
         "image_count": image_count,
+        "read_count": meta.get("read_count", ""),
+        "like_count": meta.get("like_count", ""),
         "status": "success",
         "error": "; ".join(error for error in image_errors if error),
         "absolute_markdown_path": str(article_path),
@@ -2357,7 +2378,7 @@ def download_one_markdown_only(url: str, output_dir: Path, seq: str, download_as
 
 def write_markdown_only_index(output_dir: Path, rows: list[dict[str, Any]]) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
-    fields = ["seq", "article_id", "title", "account", "source_url", "markdown_path", "image_dir", "image_count", "status", "error"]
+    fields = ["seq", "article_id", "title", "account", "source_url", "markdown_path", "image_dir", "image_count", "read_count", "like_count", "status", "error"]
     with (output_dir / "index.csv").open("w", encoding="utf-8", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=fields)
         writer.writeheader()

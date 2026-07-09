@@ -136,7 +136,7 @@ https://mp.weixin.qq.com/s/yyy
 输入：
 
 ```text
-用 exporter 模式同步「哥飞」，列出最近 50 篇让我选
+用 exporter 模式同步「某公众号」，列出最近 50 篇让我选
 ```
 
 执行：
@@ -154,7 +154,7 @@ https://mp.weixin.qq.com/s/yyy
 输入：
 
 ```text
-下载「哥飞」最近 20 篇
+下载「某公众号」最近 20 篇
 ```
 
 执行：

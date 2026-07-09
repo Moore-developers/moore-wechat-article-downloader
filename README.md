@@ -5,7 +5,7 @@
 ## 亮点
 
 - **说话即操作** — 直接告诉 AI 你想做什么，无需记命令参数
-- **输出干净可用** — 自动转 Markdown、下载配图、生成 `index.csv`，开箱即用
+- **输出干净可用** — 自动转 Markdown、下载配图、生成 `index.csv` 汇总表（含标题、链接、发布时间、作者），开箱即用
 - **按公众号整理** — 下载结果存入 `~/Downloads/wechat-articles/〈公众号名〉/`，一目了然
 - **纯 Python 标准库** — 无需 `pip install`，Python 3.10+ 即可运行
 - **内置防封节奏控制** — Token bucket 限速 + 随机间隔，大批量下载更安全
@@ -73,7 +73,7 @@
 ```
 ~/Downloads/wechat-articles/
 └── 〈公众号名〉/
-    ├── index.csv          ← 所有文章的元数据索引
+    ├── index.csv          ← 所有文章汇总表：标题、链接、发布时间、作者，可直接用 Excel / Numbers 打开
     ├── articles/
     │   └── 001-标题.md    ← 正文 Markdown
     └── images/

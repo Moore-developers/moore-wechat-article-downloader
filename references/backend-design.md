@@ -10,11 +10,11 @@ The runtime has three modes:
 
 2. Account history mode
    - Input: any one article URL from the target public account.
-   - Flow follows the `qiye45/wechatDownload` pattern: use WeChat desktop client context, fetch history list, let user select, then download selected URLs.
+   - Use WeChat desktop client context, fetch history list, let user select, then download selected URLs.
 
 3. Exporter mode
    - Input: exporter auth-key, or user action to scan-login on an exporter instance.
-   - Flow follows the `wechat-article-exporter` pattern: use a WeChat Official Account backend session to search accounts, sync article metadata, manage fields/collections in SQLite, then download selected URLs through the normal Markdown downloader.
+   - Use a WeChat Official Account backend session to search accounts, sync article metadata, manage fields/collections in SQLite, then download selected URLs through the normal Markdown downloader.
 
 Do not add unrelated platform features. Content processing, rewriting, cloud deployment, and SaaS workflows are outside the runtime core. A local management page is allowed only for Exporter mode.
 

@@ -460,6 +460,11 @@ class WeChatHistoryCapture:
         if path in IGNORED_RESPONSE_PATHS:
             self.observe(flow, ["ignored-endpoint"], 0, observe_path)
             return
+        if request.path.split("?", 1)[0] == "/mp/appmsg_comment":
+            _q = urllib.parse.parse_qs(urllib.parse.urlsplit(request.url).query, keep_blank_values=True)
+            if (_q.get("action") or [""])[0] == "getcomment":
+                self._capture_comments(flow, _q, text, observe_path)
+                return
         is_profile_getmsg = (
             request.host == "mp.weixin.qq.com"
             and request.path.split("?", 1)[0] == "/mp/profile_ext"
@@ -496,6 +501,57 @@ class WeChatHistoryCapture:
         if not new_rows:
             return
         self.write_rows(context, new_rows, method)
+
+    def _capture_comments(self, flow: Any, query: dict, text: str, observe_path: Path) -> None:
+        appmsgid = (query.get("appmsgid") or [""])[0]
+        if not appmsgid:
+            self.observe(flow, ["comment-no-appmsgid"], observe_path=observe_path)
+            return
+        try:
+            payload = json.loads(text)
+        except Exception:
+            self.observe(flow, ["comment-non-json"], observe_path=observe_path)
+            return
+        if not isinstance(payload, dict):
+            return
+        comments = payload.get("elected_comment") or []
+        if not isinstance(comments, list) or not comments:
+            self.observe(flow, ["comment-empty"], 0, observe_path)
+            return
+        rows = []
+        for c in comments:
+            if not isinstance(c, dict):
+                continue
+            rows.append({
+                "comment_id": str(c.get("id") or c.get("comment_id") or ""),
+                "nick_name": str(c.get("nick_name") or c.get("username") or ""),
+                "content": str(c.get("content") or ""),
+                "like_count": c.get("like_num") or c.get("like_count") or 0,
+                "create_time": c.get("create_time") or None,
+            })
+        if not rows:
+            return
+        capture_dir = self.base / "comments-capture"
+        capture_dir.mkdir(parents=True, exist_ok=True)
+        out = capture_dir / f"{appmsgid}.json"
+        existing: list = []
+        if out.exists():
+            try:
+                existing = json.loads(out.read_text(encoding="utf-8"))
+            except Exception:
+                existing = []
+        if not isinstance(existing, list):
+            existing = []
+        existing_ids = {r["comment_id"] for r in existing if r.get("comment_id")}
+        new_rows = [r for r in rows if not r["comment_id"] or r["comment_id"] not in existing_ids]
+        if not new_rows:
+            self.observe(flow, ["comment-already-captured"], 0, observe_path)
+            return
+        merged = json.dumps(existing + new_rows, ensure_ascii=False, indent=2) + "\n"
+        tmp = out.with_suffix(".tmp")
+        tmp.write_text(merged, encoding="utf-8")
+        os.replace(tmp, out)
+        self.observe(flow, ["comment-captured"], len(new_rows), observe_path)
 
 
 addons = [WeChatHistoryCapture()]
