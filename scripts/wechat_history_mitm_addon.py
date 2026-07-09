@@ -228,7 +228,7 @@ SNAPSHOT_SCRIPT = r"""
       btn = document.createElement('button');
       btn.id = id;
       btn.type = 'button';
-      btn.textContent = '保存快照';
+      btn.textContent = '保存这篇';
       btn.dataset.mooreCaptureButton = '1';
       btn.dataset.mooreCaptureKind = kind || 'meta';
       btn.className = kind === 'comment' ? 'moore_capture_btn_comment' : 'rich_media_meta rich_media_meta_text moore_capture_btn_meta';

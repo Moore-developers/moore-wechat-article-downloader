@@ -2202,7 +2202,7 @@ def start_proxy_enhancer(base: Path, port: int = DEFAULT_PROXY_PORT, upstream_pr
             "does_not_modify_system_proxy": True,
             "next_step": (
                 f"Route WeChat traffic to 127.0.0.1:{port} once. "
-                "Then open any WeChat article; the page should show 保存快照."
+                "Then open any WeChat article; the page should show 保存这篇."
             ),
         }
         write_proxy_service_state(base, result)
@@ -2250,7 +2250,7 @@ def status_proxy_enhancer(base: Path, port: int = DEFAULT_PROXY_PORT) -> dict[st
         "debug_log": str(debug_log),
         "latest_snapshot": latest if latest else {},
         "next_step": (
-            "If WeChat is already routed to this proxy, open an article and click 保存快照."
+            "If WeChat is already routed to this proxy, open an article and click 保存这篇."
             if status.get("running")
             else "Run proxy-enhancer-start first."
         ),
@@ -2336,7 +2336,7 @@ def proxy_enhancer_check_ingress(base: Path, port: int = DEFAULT_PROXY_PORT, min
         "article_ingress_detected": bool(article_rows),
         "latest_event": latest,
         "next_step": (
-            "Ingress OK. Open the article and click 保存快照."
+            "Ingress OK. Open the article and click 保存这篇."
             if article_rows
             else "No recent WeChat article request reached 23344. Route WeChat traffic to 127.0.0.1:23344, then reopen the article."
         ),
@@ -3662,7 +3662,7 @@ def command_snapshot_latest(args: argparse.Namespace) -> int:
         "ok": bool(latest),
         "mode": "proxy-enhancer",
         "snapshot": latest,
-        "next_step": "Open an article through the enhancer and click 保存快照." if not latest else "Use snapshot-extract latest to create structured files.",
+        "next_step": "Open an article through the enhancer and click 保存这篇." if not latest else "Use snapshot-extract latest to create structured files.",
     }
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if latest else 3
@@ -4208,7 +4208,7 @@ def extract_auto_snapshot(base: Path, snapshot_id: str = "latest", output_dir: s
             "",
             "## 边界",
             "",
-            "- 评论只包含点击保存快照时页面已加载的内容。",
+            "- 评论只包含点击保存这篇时页面已加载的内容。",
             "- 图片默认只提取 URL，不在 extract 阶段下载。",
             "- 互动数据只来自页面 DOM/文本可观察结果，缺失字段不推断。",
             "",
