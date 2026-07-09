@@ -1655,6 +1655,22 @@ def process_running(pid: int) -> bool:
         return True
 
 
+def history_proxy_process_running(pid: int, port: int) -> bool:
+    if not process_running(pid):
+        return False
+    try:
+        result = subprocess.run(
+            ["lsof", "-nP", "-a", "-p", str(pid), f"-iTCP:{port}", "-sTCP:LISTEN"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except Exception:
+        return False
+    output = result.stdout.lower()
+    return result.returncode == 0 and "mitmdump" in output and f":{port} " in output
+
+
 def mitm_addon_path() -> Path:
     return Path(__file__).resolve().parent / "wechat_history_mitm_addon.py"
 
@@ -1736,7 +1752,7 @@ def running_history_proxy_on_port(base: Path, port: int) -> tuple[dict[str, Any]
             pid = int(state.get("pid") or 0)
         except (TypeError, ValueError):
             pid = 0
-        if process_running(pid):
+        if history_proxy_process_running(pid, port):
             return state, path
     return None, None
 
@@ -1750,7 +1766,8 @@ def start_history_proxy(base: Path, session: dict[str, Any], port: int, limit: i
             pid = int(state.get("pid") or 0)
         except (TypeError, ValueError):
             pid = 0
-        if process_running(pid):
+        state_port = int(state.get("port", port) or port)
+        if history_proxy_process_running(pid, state_port):
             write_active_proxy_session(base, session, int(state.get("port", port)), pid, str(state.get("upstream_proxy", "")), state_path)
             return {
                 "ok": True,
@@ -1931,7 +1948,9 @@ def stop_history_proxy(base: Path, session_id: str) -> dict[str, Any]:
         active_pid = int(active.get("pid") or 0)
     except (TypeError, ValueError):
         active_pid = 0
-    if active_session_id and active_session_id != session_id and active_pid == pid and process_running(pid):
+    port = int(state.get("port") or 0)
+    proxy_alive = bool(port and history_proxy_process_running(pid, port))
+    if active_session_id and active_session_id != session_id and active_pid == pid and proxy_alive:
         state["status"] = "detached"
         state["detached_at"] = utc_now()
         state["active_session_id"] = active_session_id
@@ -1945,8 +1964,7 @@ def stop_history_proxy(base: Path, session_id: str) -> dict[str, Any]:
             "message": "proxy process is reused by another active session; not stopped",
             "active_session_id": active_session_id,
         }
-    port = int(state.get("port") or 0)
-    if port and process_running(pid) and system_proxy_points_to_port("", "127.0.0.1", port):
+    if port and proxy_alive and system_proxy_points_to_port("", "127.0.0.1", port):
         return {
             "ok": False,
             "session_id": session_id,
@@ -1958,7 +1976,7 @@ def stop_history_proxy(base: Path, session_id: str) -> dict[str, Any]:
             "next_step": "Run history-proxy-disable --yes before stopping this proxy; otherwise system traffic may point at a dead 127.0.0.1 port.",
         }
     stopped = False
-    if process_running(pid):
+    if proxy_alive:
         try:
             os.killpg(pid, signal.SIGTERM)
         except Exception:
@@ -1967,9 +1985,9 @@ def stop_history_proxy(base: Path, session_id: str) -> dict[str, Any]:
             except Exception:
                 pass
         deadline = time.time() + 5
-        while time.time() < deadline and process_running(pid):
+        while time.time() < deadline and history_proxy_process_running(pid, port):
             time.sleep(0.2)
-        if process_running(pid):
+        if history_proxy_process_running(pid, port):
             try:
                 os.killpg(pid, signal.SIGKILL)
             except Exception:
@@ -2331,18 +2349,29 @@ def markdown_frontmatter(meta: dict[str, Any], seq: str, image_dir: str) -> str:
     return "\n".join(lines) + "\n\n"
 
 
-def download_one_markdown_only(url: str, output_dir: Path, seq: str, download_assets: bool) -> dict[str, Any]:
+def download_one_markdown_only(
+    url: str,
+    output_dir: Path,
+    seq: str,
+    download_assets: bool,
+    filename_stem: str = "",
+) -> dict[str, Any]:
     cleaned = clean_url(url)
     raw = fetch_text(cleaned)
     meta = extract_meta(raw, cleaned)
     article_body = remove_scripts_styles(find_article_html(raw))
     content_hash = hashlib.sha256(article_body.encode("utf-8")).hexdigest()
     article_id = hashlib.sha256((meta["canonical_url"] + content_hash).encode("utf-8")).hexdigest()[:16]
-    article_rel = f"articles/{markdown_filename(seq, meta['title'])}"
-    image_rel = f"images/{seq}"
+    if filename_stem:
+        safe_stem = safe_name(filename_stem, 90)
+        article_rel = f"articles/{safe_stem}.md"
+        image_rel = f"images/{safe_stem}"
+    else:
+        article_rel = f"articles/{markdown_filename(seq, meta['title'])}"
+        image_rel = f"images/{seq}"
     article_path = output_dir / article_rel
     image_dir = output_dir / image_rel
-    normalized_html, assets = localize_markdown_images(article_body, image_dir, f"../images/{seq}", image_rel, download_assets)
+    normalized_html, assets = localize_markdown_images(article_body, image_dir, f"../{image_rel}", image_rel, download_assets)
     markdown = markdown_frontmatter(
         {
             **meta,
@@ -2402,6 +2431,7 @@ def run_markdown_only_download(
     (output_dir / "articles").mkdir(parents=True, exist_ok=True)
     (output_dir / "images").mkdir(parents=True, exist_ok=True)
     retry_limit = max(0, min(int(max_retries or 0), 3))
+    file_stems = input_payload.get("file_stems") if isinstance(input_payload.get("file_stems"), dict) else {}
 
     if aggressive:
         throttle = DownloadThrottle(req_per_min=req_per_min or 30, burst=5, inter_delay=(0.5, 1.2), init_workers=3, max_workers=5)
@@ -2418,7 +2448,7 @@ def run_markdown_only_download(
         for attempt in range(retry_limit + 1):
             throttle.acquire()
             try:
-                article = download_one_markdown_only(url, output_dir, seq, download_assets)
+                article = download_one_markdown_only(url, output_dir, seq, download_assets, str(file_stems.get(url) or ""))
                 if attempt:
                     article["retry_attempts"] = attempt
                 throttle.on_success()
@@ -2560,7 +2590,133 @@ def delivery_dir(path: str, run_id: str) -> Path:
     return (DEFAULT_DELIVERY_DIR / run_id).expanduser().resolve()
 
 
+def account_delivery_dir(root: str, account: str) -> Path:
+    base = Path(root).expanduser().resolve() if root else DEFAULT_DELIVERY_DIR.expanduser().resolve()
+    return (base / safe_name(account or "微信文章", 90)).resolve()
+
+
+def plan_markdown_account_groups(urls: list[str], output_root: str = "") -> list[dict[str, Any]]:
+    groups: dict[str, dict[str, Any]] = {}
+    for url in urls:
+        cleaned = safe_display_url(url)
+        account = "微信文章"
+        title = ""
+        try:
+            cleaned = clean_url(url)
+            raw = fetch_text(cleaned)
+            meta = extract_meta(raw, cleaned)
+            account = meta.get("account") or account
+            title = meta.get("title") or ""
+        except Exception:
+            pass
+        key = safe_name(account, 90)
+        group = groups.setdefault(
+            key,
+            {
+                "account": account,
+                "output_dir": str(account_delivery_dir(output_root, account)),
+                "urls": [],
+                "file_stems": {},
+            },
+        )
+        group["urls"].append(cleaned)
+        if title:
+            group["file_stems"][cleaned] = safe_name(title, 90)
+    for group in groups.values():
+        stems = group.get("file_stems", {})
+        counts: dict[str, int] = {}
+        for stem in stems.values():
+            counts[str(stem)] = counts.get(str(stem), 0) + 1
+        for url, stem in list(stems.items()):
+            if counts.get(str(stem), 0) > 1:
+                suffix = hashlib.sha256(str(url).encode("utf-8")).hexdigest()[:8]
+                stems[url] = safe_name(f"{stem}-{suffix}", 90)
+    return list(groups.values())
+
+
+def run_markdown_only_download_by_account(
+    urls: list[str],
+    output_root: str,
+    download_assets: bool,
+    input_payload: dict[str, Any],
+    run_id: str | None = None,
+    html_concurrency: int = 1,
+    max_retries: int = 0,
+    req_per_min: int = 20,
+    aggressive: bool = False,
+) -> dict[str, Any]:
+    run_id = run_id or make_run_id()
+    groups = plan_markdown_account_groups(urls, output_root)
+    if len(groups) == 1:
+        group = groups[0]
+        return run_markdown_only_download(
+            group["urls"],
+            Path(group["output_dir"]),
+            download_assets,
+            {**input_payload, "account": group["account"], "file_stems": group["file_stems"]},
+            run_id,
+            html_concurrency,
+            max_retries,
+            req_per_min,
+            aggressive,
+        )
+    results = []
+    articles: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+    for group in groups:
+        result = run_markdown_only_download(
+            group["urls"],
+            Path(group["output_dir"]),
+            download_assets,
+            {**input_payload, "account": group["account"], "file_stems": group["file_stems"]},
+            make_run_id(),
+            html_concurrency,
+            max_retries,
+            req_per_min,
+            aggressive,
+        )
+        result["account"] = group["account"]
+        results.append(result)
+        articles.extend(result.get("articles", []))
+        failed.extend(result.get("failed", []))
+    root = Path(output_root).expanduser().resolve() if output_root else DEFAULT_DELIVERY_DIR.expanduser().resolve()
+    return {
+        "ok": not failed,
+        "profile": "markdown-only-multi-account",
+        "run_id": run_id,
+        "output_dir": str(root),
+        "index": "",
+        "success_count": len(articles),
+        "failure_count": len(failed),
+        "html_concurrency": max(1, min(int(html_concurrency or 1), 4)),
+        "max_retries": max(0, min(int(max_retries or 0), 3)),
+        "retry_attempt_count": sum(int(item.get("retry_attempt_count") or 0) for item in results),
+        "articles": articles,
+        "failed": failed,
+        "results": results,
+        "output_dirs": [item.get("output_dir") for item in results],
+        "indexes": [item.get("index") for item in results],
+        "input": scrub_payload(input_payload),
+    }
+
+
 def print_download_summary(manifest: dict[str, Any]) -> None:
+    if manifest.get("profile") == "markdown-only-multi-account":
+        print(json.dumps(
+            {
+                "ok": manifest["failure_count"] == 0,
+                "profile": manifest["profile"],
+                "run_id": manifest["run_id"],
+                "success_count": manifest["success_count"],
+                "failure_count": manifest["failure_count"],
+                "output_dirs": manifest.get("output_dirs", []),
+                "indexes": manifest.get("indexes", []),
+                "failed": manifest["failed"],
+            },
+            ensure_ascii=False,
+            indent=2,
+        ))
+        return
     if manifest.get("profile") == "markdown-only":
         print(json.dumps(
             {
@@ -2615,12 +2771,11 @@ def run_download_for_args(urls: list[str], args: argparse.Namespace, input_paylo
         formats = parse_formats(args.formats)
         return run_download(urls, base, formats, not args.no_assets, {**input_payload, "profile": profile, "formats": sorted(formats)}, req_per_min, aggressive)
     run_id = make_run_id()
-    out_dir = delivery_dir(getattr(args, "output_dir", ""), run_id)
-    return run_markdown_only_download(
+    return run_markdown_only_download_by_account(
         urls,
-        out_dir,
+        getattr(args, "output_dir", ""),
         not args.no_assets,
-        {**input_payload, "profile": "markdown-only", "output_dir": str(out_dir)},
+        {**input_payload, "profile": "markdown-only", "output_root": getattr(args, "output_dir", "")},
         run_id,
         getattr(args, "html_concurrency", 1),
         getattr(args, "max_retries", 0),

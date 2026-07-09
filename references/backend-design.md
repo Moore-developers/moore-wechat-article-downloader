@@ -39,7 +39,7 @@ Responsibilities:
 - extract metadata
 - save one Markdown file per article
 - download allowed media assets when possible
-- write images under `images/<seq>/`
+- write images under `images/<safe-title>/`
 - write `index.csv`
 
 `--profile archive` may still write raw HTML, normalized HTML, metadata, manifest, and report for debugging.
@@ -75,10 +75,9 @@ Responsibilities:
 - sync article list with `GET /api/public/v1/article`
 - persist accounts, articles, collections, field presets, sync jobs, and download runs in `exporter.sqlite`
 - expose a local management page for search/add/sync/list/field/collection workflows
-- import enhanced metrics and comments from user-owned JSON/CSV when available
 - pass selected article URLs to the existing Markdown-only downloader
 
-Exporter mode treats collections and enhanced metrics as best-effort. Reading count, likes, comments, and shares may require short-lived WeChat article credentials and should not block list sync or downloads. When the user already has enhanced data, import it into SQLite instead of trying to silently capture credentials.
+Exporter mode does not fetch comments, reading counts, likes, shares, favorites, or other engagement metrics. Those fields require short-lived article-page credentials or browser context and belong to a separately verified proxy snapshot flow. Collections remain best-effort and should not block account/article sync or downloads.
 
 ### Skill-Driven Selection
 
@@ -94,16 +93,20 @@ The Skill shows a numbered preview in chat. The user chooses with:
 Default user-facing output:
 
 ```text
-~/Downloads/wechat-articles/<run-id>/
+~/Downloads/wechat-articles/<account-name>/
 ```
+
+URL and Exporter multi-account downloads are split by account; do not create a mixed run folder.
 
 Shape:
 
 ```text
 index.csv
-articles/<seq>-<safe-title>.md
-images/<seq>/<image-number>.<ext>
+articles/<safe-title>.md
+images/<safe-title>/<image-number>.<ext>
 ```
+
+SQLite/index state is not enough to skip an Exporter download. The Markdown file and expected image files must still exist on disk; otherwise the article is marked not downloaded and downloaded again.
 
 Internal runtime/session storage:
 
@@ -175,9 +178,6 @@ python3 scripts/wechat_exporter.py exporter-fields --set "title,url,publish_time
 python3 scripts/wechat_exporter.py exporter-collections --account-id "<id>"
 python3 scripts/wechat_exporter.py exporter-download --account-id "<id>" --latest 20
 python3 scripts/wechat_exporter.py exporter-download-collection --collection-id "<id>"
-python3 scripts/wechat_exporter.py exporter-metrics-import "<json-or-csv>"
-python3 scripts/wechat_exporter.py exporter-comments-import "<json-or-csv>"
-python3 scripts/wechat_exporter.py exporter-comments --article-id "<id>"
 ```
 
 There is no Dashboard or local web UI for URL/history flows. Exporter mode can use the local management page.

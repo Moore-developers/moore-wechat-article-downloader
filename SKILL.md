@@ -55,6 +55,8 @@ python3 {baseDir}/scripts/wechat_wizard.py retry "<task-id>"
 
 **优势**：API 稳定、无需代理、支持按名称搜索、一次登录 4 天有效、SQLite 持久化可复用。
 
+**边界**：Exporter 模式只做公众号搜索、历史文章同步和文章下载；不获取评论、阅读数、点赞数、收藏数、转发数等互动数据。互动数据只在代理快照模式验证通过后再提供。
+
 ```bash
 python3 {baseDir}/scripts/wechat_wizard.py run "获取公众号「<名称>」的历史文章"
 ```
@@ -155,15 +157,21 @@ python3 {baseDir}/scripts/wechat_exporter.py exporter-server-start --port 8765
 
 内部会话数据：`~/.moore/wechat-article-downloader/`
 
-默认下载目录：`~/Downloads/wechat-articles/<run-id>/`
+默认下载目录：
+
+- URL 模式：`~/Downloads/wechat-articles/<公众号名>/`；多公众号 URL 会按公众号拆分目录
+- Exporter 单公众号模式：`~/Downloads/wechat-articles/<公众号名>/`
+- Exporter 多公众号模式：按公众号拆分为多个 `~/Downloads/wechat-articles/<公众号名>/`
 
 输出结构：
 
 ```text
 index.csv
-articles/<seq>-<safe-title>.md
-images/<seq>/<image-number>.<ext>
+articles/<safe-title>.md
+images/<safe-title>/<image-number>.<ext>
 ```
+
+URL 模式和 Exporter 模式都不再使用可见的 `<run-id>` 交付目录。`run_id` 只保存在运行记录里。Exporter 下载会先检查账号目录里的 `index.csv` 和实际 Markdown/图片文件；SQLite 标记为已下载但文件缺失时会重新下载。
 
 ## 输出约定
 

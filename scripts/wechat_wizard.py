@@ -31,12 +31,13 @@ from wechat_downloader import (  # noqa: E402
     DEFAULT_DELIVERY_DIR,
     build_history_open_url,
     choose_network_service,
-    delivery_dir,
     extract_urls,
     get_network_proxy_state,
     history_account_dir,
     make_run_id,
     open_history_link,
+    plan_markdown_account_groups,
+    run_markdown_only_download_by_account,
     run_markdown_only_download,
     runtime_dir,
     sanitize_text_urls,
@@ -946,8 +947,8 @@ def record_download_manifest(base: Path, task_id: str, source_mode: str, manifes
                     str(item.get("article_id") or ""),
                     sanitize_text_urls(str(item.get("source_url") or item.get("url") or "")),
                     str(item.get("status") or ("failed" if item.get("error") else "success")),
-                    str(item.get("markdown_path") or ""),
-                    str(item.get("image_dir") or ""),
+                    str(item.get("absolute_markdown_path") or item.get("markdown_path") or ""),
+                    str(item.get("absolute_image_dir") or item.get("image_dir") or ""),
                     scrub_sensitive_text(str(item.get("error") or "")),
                     int(item.get("retries") or 0),
                     str(item.get("previous_run_id") or ""),
@@ -1001,6 +1002,9 @@ def previous_success_records(base: Path, task_id: str, urls: list[str]) -> dict[
             previous_markdown_path = previous_markdown
             if previous_markdown and previous_output_dir and not Path(previous_markdown).is_absolute():
                 previous_markdown_path = str(Path(previous_output_dir) / previous_markdown)
+            previous_markdown_exists = bool(previous_markdown_path and Path(previous_markdown_path).exists())
+            if not previous_markdown_exists:
+                continue
             records[url] = {
                 "source_url": url,
                 "previous_run_id": str(row["run_id"] or ""),
@@ -1008,7 +1012,7 @@ def previous_success_records(base: Path, task_id: str, urls: list[str]) -> dict[
                 "previous_output_dir": previous_output_dir,
                 "previous_markdown_path": previous_markdown_path,
                 "previous_image_dir": str(row["image_dir"] or ""),
-                "previous_markdown_exists": bool(previous_markdown_path and Path(previous_markdown_path).exists()),
+                "previous_markdown_exists": previous_markdown_exists,
             }
         return records
     finally:
@@ -1124,6 +1128,32 @@ def verify_run(output_dir: Path, manifest: dict[str, Any], base: Path | None = N
     errors_path = output_dir / "errors.json"
     markdown_files = list((output_dir / "articles").glob("*.md"))
     success_count = int(manifest.get("success_count") or 0)
+    if manifest.get("profile") == "markdown-only-multi-account":
+        result_indexes = [Path(str(item.get("index") or "")) for item in manifest.get("results", []) if item.get("index")]
+        index_ok = all(path.exists() for path in result_indexes)
+        expected_markdown = [
+            Path(str(item.get("absolute_markdown_path") or ""))
+            for item in list(manifest.get("articles") or [])
+            if str(item.get("absolute_markdown_path") or "")
+        ]
+        markdown_ok = all(path.exists() for path in expected_markdown) if expected_markdown else success_count == 0
+        articles_json_ok = json_file_is_type(articles_path, list)
+        errors_json_ok = json_file_is_type(errors_path, list)
+        skipped = list(manifest.get("skipped") or [])
+        skipped_evidence_ok = all(skipped_item_has_evidence(output_dir, item, base) for item in skipped)
+        ok = run_path.exists() and articles_json_ok and errors_json_ok and index_ok and markdown_ok and skipped_evidence_ok
+        return {
+            "ok": ok,
+            "index_exists": index_ok,
+            "run_json_exists": run_path.exists(),
+            "articles_json_ok": articles_json_ok,
+            "errors_json_ok": errors_json_ok,
+            "markdown_count": len(expected_markdown),
+            "expected_markdown_count": len(expected_markdown),
+            "success_count": success_count,
+            "skipped_count": len(skipped),
+            "skipped_evidence_ok": skipped_evidence_ok,
+        }
     expected_markdown = [
         output_dir / str(item.get("markdown_path") or "")
         for item in list(manifest.get("articles") or [])
@@ -1162,7 +1192,11 @@ def run_url_mode(
     force_source: str = "none",
 ) -> dict[str, Any]:
     run_id = make_run_id()
-    out_dir = delivery_dir(output_dir_arg, run_id) if output_dir_arg else (DEFAULT_DELIVERY_DIR / run_id).expanduser().resolve()
+    groups = plan_markdown_account_groups(intent["urls"], output_dir_arg)
+    if len(groups) == 1:
+        out_dir = Path(str(groups[0]["output_dir"])).expanduser().resolve()
+    else:
+        out_dir = Path(output_dir_arg).expanduser().resolve() if output_dir_arg else DEFAULT_DELIVERY_DIR.expanduser().resolve()
     env_gate = gate_environment(base, task_id, out_dir)
     if not env_gate["ok"]:
         save_task(base, task_id, intent, env_gate["state"], "url", str(out_dir), env_gate)
@@ -1201,9 +1235,9 @@ def run_url_mode(
     try:
         started_monotonic = time.monotonic()
         started_at = utc_now()
-        manifest = run_markdown_only_download(
+        manifest = run_markdown_only_download_by_account(
             urls_to_download,
-            out_dir,
+            output_dir_arg,
             not no_assets,
             {"mode": "wechat-wizard-url", "task_id": task_id, "urls": urls_to_download, "goal": intent["goal"]},
             run_id,
@@ -1238,10 +1272,12 @@ def run_url_mode(
             out_dir.mkdir(parents=True, exist_ok=True)
             (out_dir / "articles").mkdir(parents=True, exist_ok=True)
             (out_dir / "images").mkdir(parents=True, exist_ok=True)
-            (out_dir / "index.csv").write_text(
-                "seq,article_id,title,account,source_url,markdown_path,image_dir,image_count,status,error\n",
-                encoding="utf-8",
-            )
+            index_path = out_dir / "index.csv"
+            if not index_path.exists():
+                index_path.write_text(
+                    "seq,article_id,title,account,source_url,markdown_path,image_dir,image_count,status,error\n",
+                    encoding="utf-8",
+                )
         extra_files = write_wizard_run_files(out_dir, task_id, intent, manifest)
         verification = verify_run(out_dir, manifest, base)
         verify_gate = record_gate(base, task_id, "verify", "done" if verification["ok"] else "failed_recoverable", verification["ok"], verification)

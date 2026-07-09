@@ -28,17 +28,26 @@ Multiple URLs or URL file:
 python3 scripts/wechat_downloader.py download-list "<urls-or-file>"
 ```
 
-The default output profile is `markdown-only`. It writes:
+The default output profile is `markdown-only`. URL mode and Exporter mode both write to account directories:
 
 ```text
-~/Downloads/wechat-articles/<run-id>/
+~/Downloads/wechat-articles/<account-name>/
 |-- index.csv
 |-- articles/
-|   `-- 001-<safe-title>.md
+|   `-- <safe-title>.md
 `-- images/
-    `-- 001/
+    `-- <safe-title>/
         `-- 001.<ext>
 ```
+
+`index.csv` is a long-lived account index, and article/image paths are title based:
+
+```text
+articles/<safe-title>.md
+images/<safe-title>/<image-number>.<ext>
+```
+
+Multi-account downloads are split into one account directory per公众号, not a mixed run directory. Exporter skips only when SQLite/index and actual Markdown/image files agree.
 
 If the user provides a destination, pass:
 

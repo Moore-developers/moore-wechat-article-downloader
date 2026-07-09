@@ -8,19 +8,19 @@ The default profile is `markdown-only`.
 <output-dir>/
 |-- index.csv
 |-- articles/
-|   |-- 001-<safe-title>.md
-|   `-- 002-<safe-title>.md
+|   |-- <safe-title>.md
+|   `-- <safe-title-2>.md
 `-- images/
-    |-- 001/
+    |-- <safe-title>/
     |   `-- 001.<ext>
-    `-- 002/
+    `-- <safe-title-2>/
         `-- 001.<ext>
 ```
 
 Default output directory:
 
 ```text
-~/Downloads/wechat-articles/<run-id>/
+~/Downloads/wechat-articles/<account-name>/
 ```
 
 `index.csv` fields:
@@ -49,13 +49,13 @@ author: "..."
 publish_time: "..."
 source_url: "https://mp.weixin.qq.com/s/..."
 downloaded_at: "..."
-image_dir: "../images/001"
+image_dir: "../images/<safe-title>"
 ```
 
 Markdown image paths are relative:
 
 ```markdown
-![image](../images/001/001.jpg)
+![image](../images/<safe-title>/001.jpg)
 ```
 
 ## Archive Profile
@@ -170,19 +170,31 @@ Core tables:
 - `login_profiles`: exporter base URL, display name, status, last login time, expiry time
 - `credential_store`: Keychain account pointer or explicit plaintext fallback when the user allows it
 - `target_accounts`: fakeid, nickname, alias, avatar, description, sync counts
-- `articles`: title, URL, digest, cover, author, publish time, downloaded flags, optional metrics
+- `articles`: title, URL, digest, cover, author, publish time, downloaded flags
 - `collections`: collection title, URL, article count
 - `collection_articles`: collection membership and order
 - `field_presets`: visible fields for the local management page and export views
 - `sync_jobs`: sync progress and errors
 - `download_runs`: selected article IDs and final Markdown output directory
-- `article_comments`: optional imported comments for articles
 
-Exporter downloads still use the normal Markdown-only delivery shape:
+Exporter mode does not fetch comments, reading counts, likes, shares, favorites, or other engagement metrics. Engagement capture belongs to the proxy snapshot verification flow.
+
+URL mode and Exporter mode use stable account directories. Multi-account downloads are split by account:
 
 ```text
-~/Downloads/wechat-articles/<run-id>/
+~/Downloads/wechat-articles/<account-name>/
 index.csv
-articles/<seq>-<safe-title>.md
-images/<seq>/<image-number>.<ext>
+articles/<safe-title>.md
+images/<safe-title>/<image-number>.<ext>
+```
+
+`run_id` is still recorded in `index.csv` and SQLite `download_runs`; it is no longer the default visible folder name for URL or Exporter downloads.
+
+Exporter skips an article only when SQLite/index state and actual Markdown/image files agree. If SQLite says downloaded but files are missing, it marks the article as not downloaded and re-downloads it.
+
+Exporter multi-account downloads are split by account. For example, downloading five articles from two accounts writes:
+
+```text
+~/Downloads/wechat-articles/<account-a>/
+~/Downloads/wechat-articles/<account-b>/
 ```

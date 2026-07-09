@@ -40,7 +40,6 @@ sys.path.insert(0, str(SCRIPT_DIR))
 from wechat_downloader import (  # noqa: E402
     DEFAULT_DELIVERY_DIR,
     clean_url,
-    delivery_dir,
     make_run_id,
     run_markdown_only_download,
     runtime_dir,
@@ -74,12 +73,6 @@ ALL_FIELDS = [
     "is_deleted",
     "article_status",
     "content_downloaded",
-    "comment_downloaded",
-    "read_count",
-    "like_count",
-    "share_count",
-    "favorite_count",
-    "comment_count",
     "author",
     "is_original",
     "collection_title",
@@ -100,12 +93,6 @@ ARTICLE_FIELDS = [
     "is_deleted",
     "article_status",
     "content_downloaded",
-    "comment_downloaded",
-    "read_count",
-    "like_count",
-    "share_count",
-    "favorite_count",
-    "comment_count",
     "collection_title",
     "raw_json",
     "created_at",
@@ -857,12 +844,6 @@ def normalize_article(item: dict[str, Any], account_id: int) -> dict[str, Any]:
         "is_deleted": 1 if str(item.get("is_deleted") or item.get("deleted") or "").lower() in {"1", "true"} else 0,
         "article_status": str(item.get("article_status") or item.get("status") or "").strip(),
         "content_downloaded": 0,
-        "comment_downloaded": 0,
-        "read_count": maybe_int(item.get("read_count") or item.get("readNum")),
-        "like_count": maybe_int(item.get("like_count") or item.get("likeNum")),
-        "share_count": maybe_int(item.get("share_count") or item.get("shareNum")),
-        "favorite_count": maybe_int(item.get("favorite_count") or item.get("favoriteNum")),
-        "comment_count": maybe_int(item.get("comment_count") or item.get("commentNum")),
         "collection_title": str(item.get("collection_title") or item.get("album_title") or item.get("tag_name") or "").strip(),
         "raw_json": json_dumps(item),
     }
@@ -1103,11 +1084,6 @@ def upsert_articles(base: Path, rows: list[dict[str, Any]]) -> int:
                     is_original = excluded.is_original,
                     is_deleted = excluded.is_deleted,
                     article_status = excluded.article_status,
-                    read_count = COALESCE(excluded.read_count, articles.read_count),
-                    like_count = COALESCE(excluded.like_count, articles.like_count),
-                    share_count = COALESCE(excluded.share_count, articles.share_count),
-                    favorite_count = COALESCE(excluded.favorite_count, articles.favorite_count),
-                    comment_count = COALESCE(excluded.comment_count, articles.comment_count),
                     collection_title = excluded.collection_title,
                     raw_json = excluded.raw_json,
                     updated_at = excluded.updated_at
@@ -1265,19 +1241,39 @@ def open_original(base: Path, article_id: int) -> dict[str, Any]:
     return {"ok": True, "opened": opened, "url": article["url"], "title": article["title"]}
 
 
-def get_article_urls(base: Path, article_ids: list[int]) -> list[tuple[int, str]]:
+def get_article_download_rows(base: Path, article_ids: list[int]) -> list[dict[str, Any]]:
     if not article_ids:
         return []
     placeholders = ",".join(["?"] * len(article_ids))
     db = connect_db(base)
     try:
         rows = db.execute(
-            f"SELECT id, url FROM articles WHERE id IN ({placeholders}) ORDER BY publish_time DESC, id DESC",
+            f"""
+            SELECT
+                a.id,
+                a.account_id,
+                a.msgid,
+                a.idx,
+                a.title,
+                a.url,
+                a.publish_time,
+                a.content_downloaded,
+                t.nickname AS account_name
+            FROM articles a
+            JOIN target_accounts t ON t.id = a.account_id
+            WHERE a.id IN ({placeholders})
+            ORDER BY a.publish_time DESC, a.id DESC
+            """,
             article_ids,
         ).fetchall()
-        return [(int(row["id"]), str(row["url"])) for row in rows]
+        return [dict(row) for row in rows]
     finally:
         db.close()
+
+
+def get_article_urls(base: Path, article_ids: list[int]) -> list[tuple[int, str]]:
+    rows = get_article_download_rows(base, article_ids)
+    return [(int(row["id"]), str(row["url"])) for row in rows]
 
 
 def select_article_ids(
@@ -1305,31 +1301,227 @@ def _safe_dir_name(name: str) -> str:
     return safe or "account"
 
 
-def download_articles(
+def unique_article_file_stems(rows: list[dict[str, Any]]) -> dict[str, str]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        stem = _safe_dir_name(str(row.get("title") or "untitled"))
+        counts[stem] = counts.get(stem, 0) + 1
+    result: dict[str, str] = {}
+    for row in rows:
+        stem = _safe_dir_name(str(row.get("title") or "untitled"))
+        if counts.get(stem, 0) > 1:
+            suffix = str(row.get("msgid") or row.get("id") or "").strip()
+            stem = f"{stem}-{suffix}" if suffix else stem
+        result[str(row.get("url") or "")] = stem
+    return result
+
+
+def write_account_index(output_dir: Path, rows: list[dict[str, Any]], manifest: dict[str, Any], run_id: str) -> None:
+    index_path = output_dir / "index.csv"
+    fields = [
+        "seq",
+        "db_article_id",
+        "msgid",
+        "title",
+        "account",
+        "publish_time",
+        "source_url",
+        "markdown_path",
+        "image_dir",
+        "image_count",
+        "status",
+        "error",
+        "downloaded_at",
+        "run_id",
+        "content_article_id",
+    ]
+    existing: dict[str, dict[str, Any]] = {}
+    if index_path.exists():
+        with index_path.open("r", encoding="utf-8-sig", newline="") as fh:
+            for item in csv.DictReader(fh):
+                key = str(item.get("db_article_id") or item.get("source_url") or "")
+                if key:
+                    existing[key] = dict(item)
+    row_by_url = {str(row.get("url") or ""): row for row in rows}
+    downloaded_at = utc_now()
+    for item in manifest.get("articles", []):
+        source_url = str(item.get("source_url") or "")
+        row = row_by_url.get(source_url)
+        if not row:
+            continue
+        key = str(row.get("id"))
+        existing.pop(source_url, None)
+        existing[key] = {
+            "seq": item.get("seq", ""),
+            "db_article_id": row.get("id", ""),
+            "msgid": row.get("msgid", ""),
+            "title": row.get("title", item.get("title", "")),
+            "account": row.get("account_name", item.get("account", "")),
+            "publish_time": row.get("publish_time", ""),
+            "source_url": source_url,
+            "markdown_path": item.get("markdown_path", ""),
+            "image_dir": item.get("image_dir", ""),
+            "image_count": item.get("image_count", ""),
+            "status": item.get("status", "success"),
+            "error": item.get("error", ""),
+            "downloaded_at": downloaded_at,
+            "run_id": run_id,
+            "content_article_id": item.get("article_id", ""),
+        }
+    for item in manifest.get("failed", []):
+        source_url = str(item.get("source_url") or "")
+        row = row_by_url.get(source_url)
+        key = str(row.get("id")) if row else source_url
+        if not key:
+            continue
+        if row:
+            existing.pop(source_url, None)
+        existing[key] = {
+            **{field: "" for field in fields},
+            "seq": item.get("seq", ""),
+            "db_article_id": row.get("id", "") if row else "",
+            "msgid": row.get("msgid", "") if row else "",
+            "title": row.get("title", item.get("title", "")) if row else item.get("title", ""),
+            "account": row.get("account_name", item.get("account", "")) if row else item.get("account", ""),
+            "publish_time": row.get("publish_time", "") if row else "",
+            "source_url": source_url,
+            "status": "failed",
+            "error": item.get("error", ""),
+            "downloaded_at": downloaded_at,
+            "run_id": run_id,
+        }
+    ordered = sorted(existing.values(), key=lambda item: (str(item.get("publish_time") or ""), str(item.get("db_article_id") or "")), reverse=True)
+    with index_path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fields)
+        writer.writeheader()
+        for item in ordered:
+            writer.writerow({field: item.get(field, "") for field in fields})
+
+
+def read_account_index(output_dir: Path) -> dict[str, dict[str, str]]:
+    index_path = output_dir / "index.csv"
+    if not index_path.exists():
+        return {}
+    rows: dict[str, dict[str, str]] = {}
+    with index_path.open("r", encoding="utf-8-sig", newline="") as fh:
+        for item in csv.DictReader(fh):
+            key = str(item.get("db_article_id") or item.get("source_url") or "")
+            if key:
+                rows[key] = dict(item)
+            source_url = str(item.get("source_url") or "")
+            if source_url:
+                rows[source_url] = dict(item)
+    return rows
+
+
+def account_index_file_exists(output_dir: Path, row: dict[str, Any]) -> tuple[bool, dict[str, str]]:
+    indexed = read_account_index(output_dir)
+    item = indexed.get(str(row.get("id") or "")) or indexed.get(str(row.get("url") or ""))
+    if not item or item.get("status") != "success":
+        return False, item or {}
+    markdown = str(item.get("markdown_path") or "")
+    if not markdown:
+        return False, item
+    markdown_path = Path(markdown)
+    if not markdown_path.is_absolute():
+        markdown_path = output_dir / markdown_path
+    if not markdown_path.exists():
+        return False, item
+    try:
+        image_count = int(item.get("image_count") or 0)
+    except (TypeError, ValueError):
+        image_count = 0
+    image_dir = str(item.get("image_dir") or "")
+    if image_count > 0:
+        image_path = Path(image_dir)
+        if not image_path.is_absolute():
+            image_path = output_dir / image_path
+        if not image_path.exists():
+            return False, item
+        try:
+            image_files = [path for path in image_path.iterdir() if path.is_file()]
+        except OSError:
+            return False, item
+        if len(image_files) < image_count:
+            return False, item
+    return True, item
+
+
+def account_output_dir(root: str, account_name: str) -> Path:
+    safe_account = _safe_dir_name(account_name)
+    if root:
+        return (Path(root).expanduser().resolve() / safe_account).resolve()
+    return (DEFAULT_DELIVERY_DIR / safe_account).expanduser().resolve()
+
+
+def download_account_articles(
     base: Path,
-    article_ids: list[int],
-    output_dir: str = "",
+    rows: list[dict[str, Any]],
+    output_root: str = "",
     no_assets: bool = False,
-    account_nickname: str = "",
 ) -> dict[str, Any]:
-    pairs = get_article_urls(base, article_ids)
-    if not pairs:
+    if not rows:
         raise RuntimeError("no articles selected")
+    account_name = str(rows[0].get("account_name") or "account")
+    out_dir = account_output_dir(output_root, account_name)
+    skipped: list[dict[str, Any]] = []
+    rows_to_download: list[dict[str, Any]] = []
+    redownload_count = 0
+    missing_downloaded_ids: list[int] = []
+    for row in rows:
+        exists, index_item = account_index_file_exists(out_dir, row)
+        if exists:
+            skipped.append({
+                "article_id": int(row["id"]),
+                "title": row.get("title", ""),
+                "source_url": row.get("url", ""),
+                "markdown_path": index_item.get("markdown_path", ""),
+                "image_dir": index_item.get("image_dir", ""),
+                "status": "skipped",
+                "skip_reason": "file_exists",
+            })
+        else:
+            if int(row.get("content_downloaded") or 0):
+                redownload_count += 1
+                missing_downloaded_ids.append(int(row["id"]))
+            rows_to_download.append(row)
+    if not rows_to_download:
+        return {
+            "ok": True,
+            "run_id": "",
+            "account": account_name,
+            "account_id": int(rows[0].get("account_id") or 0),
+            "output_dir": str(out_dir),
+            "index": str(out_dir / "index.csv"),
+            "selected_count": len(rows),
+            "success_count": 0,
+            "failure_count": 0,
+            "skipped_count": len(skipped),
+            "redownload_count": 0,
+            "skipped": skipped,
+            "failed": [],
+        }
+    pairs = [(int(row["id"]), str(row["url"])) for row in rows_to_download]
     urls = [url for _article_id, url in pairs]
+    article_ids = [article_id for article_id, _url in pairs]
+    if missing_downloaded_ids:
+        db = connect_db(base)
+        try:
+            for article_id in missing_downloaded_ids:
+                db.execute("UPDATE articles SET content_downloaded = 0, updated_at = ? WHERE id = ?", (utc_now(), article_id))
+            db.commit()
+        finally:
+            db.close()
     run_id = make_run_id()
-    if output_dir:
-        out_dir = delivery_dir(output_dir, run_id)
-    elif account_nickname:
-        out_dir = (DEFAULT_DELIVERY_DIR / _safe_dir_name(account_nickname)).expanduser().resolve()
-    else:
-        out_dir = (DEFAULT_DELIVERY_DIR / run_id).expanduser().resolve()
+    file_stems = unique_article_file_stems(rows_to_download)
     manifest = run_markdown_only_download(
         urls,
         out_dir,
         not no_assets,
-        {"mode": "exporter-download", "article_ids": article_ids},
+        {"mode": "exporter-download", "article_ids": article_ids, "account": account_name, "file_stems": file_stems},
         run_id,
     )
+    write_account_index(out_dir, rows_to_download, manifest, run_id)
     success_urls = {item.get("source_url") for item in manifest.get("articles", [])}
     db = connect_db(base)
     try:
@@ -1349,11 +1541,51 @@ def download_articles(
     return {
         "ok": manifest["failure_count"] == 0,
         "run_id": manifest["run_id"],
+        "account": account_name,
+        "account_id": int(rows[0].get("account_id") or 0),
         "output_dir": manifest["output_dir"],
         "index": manifest["index"],
+        "selected_count": len(rows),
         "success_count": manifest["success_count"],
         "failure_count": manifest["failure_count"],
+        "skipped_count": len(skipped),
+        "redownload_count": redownload_count,
+        "skipped": skipped,
         "failed": manifest["failed"],
+    }
+
+
+def download_articles(
+    base: Path,
+    article_ids: list[int],
+    output_dir: str = "",
+    no_assets: bool = False,
+    account_nickname: str = "",
+) -> dict[str, Any]:
+    rows = get_article_download_rows(base, article_ids)
+    if not rows:
+        raise RuntimeError("no articles selected")
+    grouped: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(int(row.get("account_id") or 0), []).append(row)
+    if len(grouped) == 1:
+        only_rows = next(iter(grouped.values()))
+        return download_account_articles(base, only_rows, output_dir, no_assets)
+    results = [download_account_articles(base, group_rows, output_dir, no_assets) for _account_id, group_rows in sorted(grouped.items())]
+    return {
+        "ok": all(result.get("ok") for result in results),
+        "mode": "multi-account",
+        "account_count": len(results),
+        "selected_count": sum(int(result.get("selected_count") or 0) for result in results),
+        "success_count": sum(int(result.get("success_count") or 0) for result in results),
+        "failure_count": sum(int(result.get("failure_count") or 0) for result in results),
+        "skipped_count": sum(int(result.get("skipped_count") or 0) for result in results),
+        "redownload_count": sum(int(result.get("redownload_count") or 0) for result in results),
+        "results": results,
+        "output_dirs": [result.get("output_dir") for result in results],
+        "indexes": [result.get("index") for result in results],
+        "skipped": [item for result in results for item in result.get("skipped", [])],
+        "failed": [item for result in results for item in result.get("failed", [])],
     }
 
 
@@ -1831,13 +2063,12 @@ def render_articles_table(articles: list[dict[str, Any]]) -> str:
             f"<td>{html_escape(item['title'])}<div class='small'>{html_escape(item['digest'])}</div></td>"
             f"<td>{html_escape(item['publish_time'])}</td>"
             f"<td>{'是' if item['content_downloaded'] else '否'}</td>"
-            f"<td>{html_escape(item['read_count'] or '')}</td>"
             f"<td><a href='{html_escape(item['url'])}' target='_blank'>原文</a></td>"
             "</tr>"
         )
     return (
         "<form id='download-selected' method='post' action='/download-selected'></form>"
-        "<table><thead><tr><th></th><th>ID</th><th>标题</th><th>发布时间</th><th>内容已下载</th><th>阅读</th><th>操作</th></tr></thead>"
+        "<table><thead><tr><th></th><th>ID</th><th>标题</th><th>发布时间</th><th>内容已下载</th><th>操作</th></tr></thead>"
         "<tbody>"
         + "".join(rows)
         + "</tbody></table><p><button form='download-selected'>下载选中</button></p>"
@@ -2321,6 +2552,15 @@ def command_daily_run(args: argparse.Namespace) -> int:
 
 def command_articles(args: argparse.Namespace) -> int:
     rows = list_articles(runtime_dir(args.runtime_dir), args.account_id, args.limit, args.keyword, args.collection_id, args.downloaded)
+    legacy_engagement_fields = {
+        "comment_downloaded",
+        "read_count",
+        "like_count",
+        "share_count",
+        "favorite_count",
+        "comment_count",
+    }
+    rows = [{key: value for key, value in row.items() if key not in legacy_engagement_fields} for row in rows]
     write_json_response({"ok": True, "count": len(rows), "articles": rows})
     return 0
 
@@ -2379,27 +2619,6 @@ def command_download_collection(args: argparse.Namespace) -> int:
     result = download_articles(base, ids, args.output_dir, args.no_assets)
     write_json_response(result)
     return 0 if result.get("ok") else 1
-
-
-def command_metrics_import(args: argparse.Namespace) -> int:
-    write_json_response(import_metrics(runtime_dir(args.runtime_dir), args.input))
-    return 0
-
-
-def command_comments_import(args: argparse.Namespace) -> int:
-    write_json_response(import_comments(runtime_dir(args.runtime_dir), args.input))
-    return 0
-
-
-def command_comments_flush(args: argparse.Namespace) -> int:
-    write_json_response(flush_captured_comments(runtime_dir(args.runtime_dir)))
-    return 0
-
-
-def command_comments(args: argparse.Namespace) -> int:
-    rows = list_comments(runtime_dir(args.runtime_dir), args.article_id, args.limit)
-    write_json_response({"ok": True, "count": len(rows), "comments": rows})
-    return 0
 
 
 def normalize_match_text(value: Any) -> str:
@@ -3101,26 +3320,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output-dir", default="")
     p.add_argument("--no-assets", action="store_true")
     p.set_defaults(func=command_download_collection)
-
-    p = sub.add_parser("exporter-metrics-import")
-    p.add_argument("--runtime-dir", default=argparse.SUPPRESS)
-    p.add_argument("input", help="JSON/CSV path or JSON text with article_id/url and read/like/share/comment counts")
-    p.set_defaults(func=command_metrics_import)
-
-    p = sub.add_parser("exporter-comments-import")
-    p.add_argument("--runtime-dir", default=argparse.SUPPRESS)
-    p.add_argument("input", help="JSON/CSV path or JSON text with article_id/url and comment content")
-    p.set_defaults(func=command_comments_import)
-
-    p = sub.add_parser("exporter-comments-flush")
-    p.add_argument("--runtime-dir", default=argparse.SUPPRESS)
-    p.set_defaults(func=command_comments_flush)
-
-    p = sub.add_parser("exporter-comments")
-    p.add_argument("--runtime-dir", default=argparse.SUPPRESS)
-    p.add_argument("--article-id", type=int, required=True)
-    p.add_argument("--limit", type=int, default=100)
-    p.set_defaults(func=command_comments)
 
     p = sub.add_parser("exporter-wizard")
     p.add_argument("--runtime-dir", default=argparse.SUPPRESS)
