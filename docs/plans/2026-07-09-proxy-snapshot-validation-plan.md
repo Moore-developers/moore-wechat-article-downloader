@@ -211,3 +211,51 @@ python3 scripts/wechat_downloader.py proxy-snapshot-verify "<article-url>"
 2. 用子智能体验证 Exporter 下载“向索然”最新 3 篇文章。
 3. 跑本地编译和基础命令检查。
 4. 进入代理快照验证 PoC，不直接做正式功能。
+
+## 已落地 PoC
+
+新增独立代理文章快照入口，不替换旧代理历史列表。
+
+当前主流程改为常驻增强代理：
+
+```bash
+python3 scripts/wechat_downloader.py proxy-enhancer-start --port 23344 --upstream-proxy auto
+python3 scripts/wechat_downloader.py proxy-enhancer-status --port 23344
+python3 scripts/wechat_downloader.py snapshot-latest
+python3 scripts/wechat_downloader.py snapshot-list --limit 10
+python3 scripts/wechat_downloader.py snapshot-export "<snapshot-id>"
+```
+
+`proxy-enhancer-session-start` 启动/复用 `23344`，切换 active adapter，并把系统 HTTP/HTTPS 代理切到 `127.0.0.1:23344`。这样微信内置浏览器流量会进入增强代理。
+
+关键边界：
+
+- `23344` 常驻和上游串联已经由本地代理负责。
+- 进入代理增强模式时由 Skill 自动建立 `WeChat -> 23344 -> 10808 -> 外网`。
+- 不再新增 launchd 自启动；当前重点不是“让 23344 常驻”，而是让系统代理在用户明确进入代理增强时切到 23344。
+- 完成快照后不自动恢复系统代理。只有用户明确说恢复/结束代理增强，才运行 `proxy-enhancer-session-finish --yes`。
+
+新增检查命令：
+
+```bash
+python3 scripts/wechat_downloader.py proxy-enhancer-session-start --port 23344 --upstream-proxy auto --yes
+python3 scripts/wechat_downloader.py proxy-enhancer-session-finish --yes
+python3 scripts/wechat_downloader.py proxy-enhancer-route-help --port 23344
+python3 scripts/wechat_downloader.py proxy-enhancer-check-ingress --port 23344 --minutes 10
+```
+
+旧调试入口仍保留，但不作为 Skill 主流程：
+
+```bash
+python3 scripts/wechat_downloader.py proxy-snapshot-prepare "<article-url>" --port 23344 --upstream-proxy auto --yes
+python3 scripts/wechat_downloader.py proxy-snapshot-status "<session-id>"
+python3 scripts/wechat_downloader.py proxy-snapshot-finish "<session-id>" --yes
+```
+
+能力边界：
+
+- `history-capture-*` 继续作为历史列表备用，不改原流程。
+- `proxy-enhancer-*` 负责常驻文章页增强。
+- `proxy-snapshot-*` 降级为调试兼容路径。
+- mitmproxy 在文章 HTML 注入 `保存当前页面` 按钮。
+- 点击按钮后自动生成 `proxy-snapshots/<snapshot-id>/`，保存 DOM、正文 DOM、评论 DOM、互动 DOM、metrics、network 摘要、style profile 和 report。

@@ -185,6 +185,90 @@ It must not write or print raw cookies, tokens, pass tickets, keys, or auth head
 
 `adapter-watch` waits for the proxy adapter's safe ready marker and then materializes the history files.
 
+## Proxy Article Snapshot Mode
+
+Use this only when the user asks for current-page deep data: comments, read/like/favorite counts, rendered DOM, or public-account style. Do not use it for ordinary history list retrieval; Exporter remains the default, and the old proxy history flow remains a backup.
+
+Primary flow: start the persistent enhancer session. It routes system HTTP/HTTPS proxy to `23344` so WeChat WebView enters the enhancer. Do not restore automatically after capture; restore only when the user explicitly asks.
+
+```bash
+python3 scripts/wechat_downloader.py proxy-enhancer-session-start --port 23344 --upstream-proxy auto --yes
+```
+
+The command starts or reuses the local mitmproxy service, switches the active adapter to `proxy-enhancer`, saves the current system proxy state, and routes HTTP/HTTPS to `127.0.0.1:23344`. It creates:
+
+```text
+~/.moore/wechat-article-downloader/proxy-snapshots/
+```
+
+Tell the user:
+
+```text
+重新打开任意公众号文章；等评论/底部互动区加载完成后，点击页面右下角“保存当前页面”。系统代理会保持在 23344，直到你明确要求恢复。
+```
+
+Check enhancer status:
+
+```bash
+python3 scripts/wechat_downloader.py proxy-enhancer-status --port 23344
+```
+
+Check routing facts and ingress:
+
+```bash
+python3 scripts/wechat_downloader.py proxy-enhancer-route-help --port 23344
+python3 scripts/wechat_downloader.py proxy-enhancer-check-ingress --port 23344 --minutes 10
+```
+
+Interpretation:
+
+- `proxy-enhancer-start` keeps `23344` ready and chains outbound to the detected upstream proxy.
+- It does not force WeChat traffic into `23344`.
+- `proxy-enhancer-check-ingress` is the gate: if no article request reached `23344`, the button cannot appear.
+
+Read captured snapshots:
+
+```bash
+python3 scripts/wechat_downloader.py snapshot-latest
+python3 scripts/wechat_downloader.py snapshot-list --limit 10
+python3 scripts/wechat_downloader.py snapshot-export "<snapshot-id>"
+```
+
+Stop the enhancer only when the user explicitly asks:
+
+```bash
+python3 scripts/wechat_downloader.py proxy-enhancer-stop --port 23344 --yes
+```
+
+`proxy-snapshot-prepare --yes` is deprecated and should only be used as a debug fallback because it temporarily changes macOS system proxy settings.
+
+Restore system proxy only when the user explicitly asks:
+
+```bash
+python3 scripts/wechat_downloader.py proxy-enhancer-session-finish --yes
+```
+
+This does not stop the persistent `23344` proxy service.
+
+Expected files:
+
+```text
+snapshot.json
+dom.html
+body.txt
+js_content.html
+comments_dom.html
+engagement_dom.html
+metrics.json
+comments.json
+network.jsonl
+style_profile.json
+style_summary.md
+report.md
+```
+
+Metrics are evidence-based. Missing fields stay `missing`; do not infer numbers from surrounding text.
+
 ## Exporter Mode
 
 Use Exporter mode when the user mentions `wechat-article-exporter`, exporter auth-key, QR login, searching public accounts by keyword, managing followed target accounts, field configuration, or collection download.

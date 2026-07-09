@@ -871,6 +871,18 @@ def system_proxy_state_path(base: Path) -> Path:
     return base / "context" / "system-proxy-state.json"
 
 
+def proxy_snapshot_dir(base: Path, session_id: str) -> Path:
+    return base / "proxy-snapshot-runs" / session_id
+
+
+def auto_snapshot_root(base: Path) -> Path:
+    return base / "proxy-snapshots"
+
+
+def auto_snapshot_index_path(base: Path) -> Path:
+    return auto_snapshot_root(base) / "index.jsonl"
+
+
 def safe_context_status(marker: dict[str, Any]) -> dict[str, Any]:
     safe_keys = ["status", "ready", "ready_at", "adapter", "method", "article_count", "history_csv", "history_json"]
     return {key: marker[key] for key in safe_keys if key in marker}
@@ -1678,7 +1690,7 @@ def history_proxy_process_running(pid: int, port: int) -> bool:
     except Exception:
         return False
     output = result.stdout.lower()
-    return result.returncode == 0 and "mitmdump" in output and f":{port} " in output
+    return result.returncode == 0 and "mitmdump" in output and re.search(rf":{port}\b", output) is not None
 
 
 def mitm_addon_path() -> Path:
@@ -2129,6 +2141,23 @@ def service_session(base: Path, port: int) -> dict[str, Any]:
     }
 
 
+def enhancer_session(base: Path, port: int) -> dict[str, Any]:
+    root = auto_snapshot_root(base)
+    return {
+        "session_id": "proxy-enhancer",
+        "mode": "proxy-enhancer",
+        "status": "running",
+        "created_at": utc_now(),
+        "account_id": "",
+        "account_name": "",
+        "sample_url": "",
+        "snapshot_root": str(root),
+        "snapshot_index": str(auto_snapshot_index_path(base)),
+        "network_jsonl": str(root / "network.jsonl"),
+        "port": port,
+    }
+
+
 def start_proxy_service(base: Path, port: int = DEFAULT_PROXY_PORT, upstream_proxy: str = "auto") -> dict[str, Any]:
     ensure_runtime(base)
     setup = proxy_setup_status(port)
@@ -2142,6 +2171,36 @@ def start_proxy_service(base: Path, port: int = DEFAULT_PROXY_PORT, upstream_pro
     session = service_session(base, port)
     result = start_history_proxy(base, session, port, 1, upstream_proxy)
     if result.get("ok"):
+        write_proxy_service_state(base, result)
+    return result
+
+
+def start_proxy_enhancer(base: Path, port: int = DEFAULT_PROXY_PORT, upstream_proxy: str = "auto") -> dict[str, Any]:
+    ensure_runtime(base)
+    setup = proxy_setup_status(port)
+    if not setup.get("ok"):
+        return {
+            "ok": False,
+            "stage": "setup",
+            "setup": setup,
+            "next_step": setup.get("next_step", "Install mitmproxy, then retry proxy-enhancer-start."),
+        }
+    session = enhancer_session(base, port)
+    auto_snapshot_root(base).mkdir(parents=True, exist_ok=True)
+    save_history_session(base, session)
+    result = start_history_proxy(base, session, port, 1, upstream_proxy)
+    if result.get("ok"):
+        result = {
+            **result,
+            "mode": "proxy-enhancer",
+            "snapshot_root": session["snapshot_root"],
+            "snapshot_index": session["snapshot_index"],
+            "does_not_modify_system_proxy": True,
+            "next_step": (
+                f"Route WeChat traffic to 127.0.0.1:{port} once. "
+                "Then open any WeChat article; the page should show 保存快照."
+            ),
+        }
         write_proxy_service_state(base, result)
     return result
 
@@ -2172,6 +2231,252 @@ def status_proxy_service(base: Path, port: int = DEFAULT_PROXY_PORT) -> dict[str
         "active_session_id": active.get("session_id", ""),
         "mitm_scope": (running_state or saved).get("mitm_scope", "wechat-only"),
         "system_proxy_points_here": system_proxy_points_to_port("", "127.0.0.1", port),
+    }
+
+
+def status_proxy_enhancer(base: Path, port: int = DEFAULT_PROXY_PORT) -> dict[str, Any]:
+    status = status_proxy_service(base, port)
+    latest = latest_auto_snapshot(base)
+    debug_log = auto_snapshot_root(base) / "debug.jsonl"
+    return {
+        **status,
+        "mode": "proxy-enhancer",
+        "snapshot_root": str(auto_snapshot_root(base)),
+        "snapshot_index": str(auto_snapshot_index_path(base)),
+        "debug_log": str(debug_log),
+        "latest_snapshot": latest if latest else {},
+        "next_step": (
+            "If WeChat is already routed to this proxy, open an article and click 保存快照."
+            if status.get("running")
+            else "Run proxy-enhancer-start first."
+        ),
+    }
+
+
+def parse_jsonl_tail(path: Path, max_lines: int = 200) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()[-max_lines:]
+    except Exception:
+        return []
+    rows: list[dict[str, Any]] = []
+    for line in lines:
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            rows.append(payload)
+    return rows
+
+
+def proxy_enhancer_logs(base: Path, hours: int = 24, limit: int = 80) -> dict[str, Any]:
+    path = auto_snapshot_root(base) / "debug.jsonl"
+    hours = max(1, min(int(hours or 24), 24))
+    limit = max(1, min(int(limit or 80), 500))
+    rows = parse_jsonl_tail(path, 5000)
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=hours)
+    recent: list[dict[str, Any]] = []
+    for row in rows:
+        at = parse_time(str(row.get("at") or ""))
+        if at and at.tzinfo is None:
+            at = at.replace(tzinfo=dt.timezone.utc)
+        if at and at < cutoff:
+            continue
+        recent.append(row)
+    return {
+        "ok": True,
+        "mode": "proxy-enhancer",
+        "log": str(path),
+        "exists": path.exists(),
+        "retention_hours": 24,
+        "prune_interval_hours": 12,
+        "window_hours": hours,
+        "event_count": len(recent),
+        "events": recent[-limit:],
+        "next_step": "Reload the WeChat article, then rerun proxy-enhancer-logs if no script/client events appear.",
+    }
+
+
+def proxy_enhancer_check_ingress(base: Path, port: int = DEFAULT_PROXY_PORT, minutes: int = 10) -> dict[str, Any]:
+    status = status_proxy_enhancer(base, port)
+    network_path = auto_snapshot_root(base) / "network.jsonl"
+    rows = parse_jsonl_tail(network_path, 500)
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=max(minutes, 1))
+    recent_rows: list[dict[str, Any]] = []
+    article_rows: list[dict[str, Any]] = []
+    for row in rows:
+        at = parse_time(str(row.get("at") or ""))
+        if at and at.tzinfo is None:
+            at = at.replace(tzinfo=dt.timezone.utc)
+        if at and at < cutoff:
+            continue
+        recent_rows.append(row)
+        markers = row.get("markers") if isinstance(row.get("markers"), list) else []
+        if row.get("host") == "mp.weixin.qq.com" and "article-page" in markers:
+            article_rows.append(row)
+    latest = article_rows[-1] if article_rows else (recent_rows[-1] if recent_rows else {})
+    return {
+        "ok": True,
+        "mode": "proxy-enhancer",
+        "proxy_running": bool(status.get("running")),
+        "proxy": f"127.0.0.1:{port}",
+        "upstream_proxy": status.get("upstream_proxy", ""),
+        "system_proxy_points_here": bool(status.get("system_proxy_points_here")),
+        "network_log": str(network_path),
+        "window_minutes": max(minutes, 1),
+        "recent_request_count": len(recent_rows),
+        "recent_article_page_count": len(article_rows),
+        "wechat_ingress_detected": bool(recent_rows),
+        "article_ingress_detected": bool(article_rows),
+        "latest_event": latest,
+        "next_step": (
+            "Ingress OK. Open the article and click 保存快照."
+            if article_rows
+            else "No recent WeChat article request reached 23344. Route WeChat traffic to 127.0.0.1:23344, then reopen the article."
+        ),
+    }
+
+
+def installed_proxy_apps() -> dict[str, str]:
+    candidates = {
+        "v2rayN": [Path("/Applications/v2rayN.app"), Path.home() / "Applications" / "v2rayN.app"],
+        "Clash Verge": [Path("/Applications/Clash Verge.app"), Path.home() / "Applications" / "Clash Verge.app"],
+        "Proxifier": [Path("/Applications/Proxifier.app"), Path.home() / "Applications" / "Proxifier.app"],
+        "Surge": [Path("/Applications/Surge.app"), Path.home() / "Applications" / "Surge.app"],
+    }
+    found: dict[str, str] = {}
+    for name, paths in candidates.items():
+        for path in paths:
+            if path.exists():
+                found[name] = str(path)
+                break
+    return found
+
+
+def process_matches(pattern: str) -> list[str]:
+    result = subprocess.run(["ps", "ax", "-o", "pid,args"], text=True, capture_output=True, check=False)
+    rows = []
+    regex = re.compile(pattern, re.I)
+    for line in result.stdout.splitlines():
+        if regex.search(line) and "wechat_downloader.py" not in line:
+            rows.append(line.strip())
+    return rows[:20]
+
+
+def current_system_proxy_summary() -> dict[str, Any]:
+    if sys.platform != "darwin":
+        return {"ok": False, "error": "system proxy summary is implemented for macOS only"}
+    try:
+        service = choose_network_service("")
+        state = get_network_proxy_state(service)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    web = state.get("web") if isinstance(state.get("web"), dict) else {}
+    secure = state.get("secure_web") if isinstance(state.get("secure_web"), dict) else {}
+    return {
+        "ok": True,
+        "service": service,
+        "web": {
+            "enabled": bool(web.get("enabled_bool")),
+            "server": web.get("server", ""),
+            "port": web.get("port", ""),
+        },
+        "secure_web": {
+            "enabled": bool(secure.get("enabled_bool")),
+            "server": secure.get("server", ""),
+            "port": secure.get("port", ""),
+        },
+    }
+
+
+def proxy_enhancer_route_help(base: Path, port: int = DEFAULT_PROXY_PORT) -> dict[str, Any]:
+    status = status_proxy_enhancer(base, port)
+    apps = installed_proxy_apps()
+    system_proxy = current_system_proxy_summary()
+    v2ray_processes = process_matches(r"v2ray|sing-box|xray")
+    clash_processes = process_matches(r"clash|mihomo|verge")
+    return {
+        "ok": True,
+        "goal": f"system/WeChat -> 127.0.0.1:{port} -> {status.get('upstream_proxy') or 'direct'} -> outside",
+        "proxy_enhancer": {
+            "running": bool(status.get("running")),
+            "proxy": f"127.0.0.1:{port}",
+            "upstream_proxy": status.get("upstream_proxy", ""),
+            "system_proxy_points_here": bool(status.get("system_proxy_points_here")),
+        },
+        "installed_apps": apps,
+        "system_proxy": system_proxy,
+        "running_proxy_processes": {
+            "v2ray_or_sing_box": v2ray_processes,
+            "clash_or_mihomo": clash_processes,
+        },
+        "recommended_path": (
+            f"Run proxy-enhancer-session-start --port {port} --upstream-proxy auto --yes. "
+            f"This routes system HTTP/HTTPS to 127.0.0.1:{port}; 23344 then chains to the detected upstream proxy or direct."
+        ),
+        "upstream_auto_rule": "Use current system proxy as upstream when it is not 23344; use saved previous proxy when system proxy is already 23344; otherwise direct.",
+        "stop_rule": f"Do not stop 127.0.0.1:{port} while the system proxy points to it. Use proxy-enhancer-session-finish --yes first, or proxy-enhancer-restart --yes for reloads.",
+    }
+
+
+def start_proxy_enhancer_session(
+    base: Path,
+    port: int = DEFAULT_PROXY_PORT,
+    upstream_proxy: str = "auto",
+    yes: bool = False,
+) -> dict[str, Any]:
+    if not yes:
+        return {
+            "ok": False,
+            "requires_confirmation": True,
+            "proxy": f"127.0.0.1:{port}",
+            "next_step": "Rerun with --yes to route system HTTP/HTTPS proxy to 23344. It will stay there until proxy-enhancer-session-finish is run.",
+        }
+    start = start_proxy_enhancer(base, port, upstream_proxy)
+    if not start.get("ok"):
+        return {"ok": False, "stage": "proxy_enhancer_start", "proxy_enhancer": start}
+    already_enabled = system_proxy_points_to_port("", "127.0.0.1", port)
+    if already_enabled:
+        enable = {
+            "ok": True,
+            "already_enabled": True,
+            "proxy": f"127.0.0.1:{port}",
+            "message": "system proxy already points to proxy-enhancer",
+        }
+    else:
+        enable = enable_system_proxy(base, "", "127.0.0.1", port, True)
+    if not enable.get("ok"):
+        return {"ok": False, "stage": "system_proxy_enable", "proxy_enhancer": start, "enable": enable}
+    status = status_proxy_enhancer(base, port)
+    return {
+        "ok": True,
+        "mode": "proxy-enhancer-session",
+        "proxy": f"127.0.0.1:{port}",
+        "upstream_proxy": start.get("upstream_proxy", ""),
+        "system_proxy_points_here": bool(status.get("system_proxy_points_here")),
+        "proxy_already_enabled": already_enabled,
+        "proxy_enhancer": start,
+        "enable": enable,
+        "next_step": "Open or reload the WeChat article. The system proxy will stay on 23344 until you explicitly run proxy-enhancer-session-finish.",
+    }
+
+
+def finish_proxy_enhancer_session(base: Path, yes: bool = False) -> dict[str, Any]:
+    if not yes:
+        return {
+            "ok": False,
+            "requires_confirmation": True,
+            "next_step": "Rerun with --yes to restore the saved system HTTP/HTTPS proxy. The 23344 proxy service will keep running.",
+        }
+    restore = disable_system_proxy(base, yes=True)
+    return {
+        "ok": bool(restore.get("ok")),
+        "mode": "proxy-enhancer-session",
+        "restore": restore,
+        "proxy_service_kept_running": True,
+        "next_step": "System proxy restored. The 23344 local enhancer remains available.",
     }
 
 
@@ -2208,6 +2513,81 @@ def stop_proxy_service(base: Path, port: int = DEFAULT_PROXY_PORT, yes: bool = F
         write_json(running_state_path, running_state)
     write_proxy_service_state(base, running_state)
     return {"ok": True, "stopped": stopped, "pid": pid, "port": port, "state": str(proxy_service_state_path(base))}
+
+
+def restart_proxy_enhancer_safely(
+    base: Path,
+    port: int = DEFAULT_PROXY_PORT,
+    upstream_proxy: str = "auto",
+    yes: bool = False,
+) -> dict[str, Any]:
+    ensure_runtime(base)
+    if not yes:
+        return {
+            "ok": False,
+            "requires_confirmation": True,
+            "proxy": f"127.0.0.1:{port}",
+            "next_step": "Rerun with --yes. If system proxy points to 23344, it will first be moved to the upstream proxy, then moved back.",
+        }
+
+    running_state, running_state_path = running_history_proxy_on_port(base, port)
+    pointed_here = system_proxy_points_to_port("", "127.0.0.1", port)
+    service = choose_network_service("") if pointed_here else ""
+    bypass: dict[str, Any] = {"applied": False}
+
+    if pointed_here:
+        endpoint = parse_proxy_endpoint(str((running_state or {}).get("upstream_proxy") or ""))
+        if not endpoint:
+            endpoint = saved_previous_proxy_endpoint(base)
+        if not endpoint:
+            return {
+                "ok": False,
+                "stage": "bypass",
+                "proxy": f"127.0.0.1:{port}",
+                "error": "cannot find an upstream proxy to keep network alive during restart",
+                "next_step": "Run proxy-enhancer-session-finish --yes first, or provide --upstream-proxy http://host:port.",
+            }
+        bypass = {
+            "applied": True,
+            "reason": "system proxy pointed to the local enhancer",
+            "temporary_proxy": f"{endpoint[0]}:{endpoint[1]}",
+            "set": set_system_proxy_host_port(service, endpoint[0], endpoint[1]),
+        }
+
+    stopped = False
+    old_pid = 0
+    if running_state:
+        old_pid = int(running_state.get("pid") or 0)
+        stopped = stop_proxy_process(old_pid, port)
+        running_state["status"] = "stopped"
+        running_state["stopped_at"] = utc_now()
+        if running_state_path:
+            write_json(running_state_path, running_state)
+
+    start = start_proxy_enhancer(base, port, upstream_proxy)
+    restored_to_enhancer: dict[str, Any] = {"applied": False}
+    if start.get("ok") and pointed_here:
+        restored_to_enhancer = {
+            "applied": True,
+            "set": set_system_proxy_host_port(service, "127.0.0.1", port),
+        }
+
+    return {
+        "ok": bool(start.get("ok")),
+        "mode": "proxy-enhancer",
+        "port": port,
+        "old_pid": old_pid,
+        "stopped_old_process": stopped,
+        "bypass": bypass,
+        "start": start,
+        "restored_to_enhancer": restored_to_enhancer,
+        "system_proxy_points_here": system_proxy_points_to_port("", "127.0.0.1", port),
+        "next_step": (
+            "Reload the WeChat article; the new enhancer code is active."
+            if start.get("ok")
+            else "The system proxy was left on the temporary upstream instead of a dead 23344 port."
+        ),
+    }
 
 
 def run_networksetup(args: list[str]) -> subprocess.CompletedProcess[str]:
@@ -2419,6 +2799,50 @@ def disable_system_proxy(base: Path, service: str = "", yes: bool = False) -> di
         "restored": True,
         "state": str(state_path),
     }
+
+
+def set_system_proxy_host_port(service: str, host: str, port: int) -> dict[str, Any]:
+    selected = choose_network_service(service)
+    run_networksetup(["-setwebproxy", selected, host, str(port)])
+    run_networksetup(["-setsecurewebproxy", selected, host, str(port)])
+    run_networksetup(["-setwebproxystate", selected, "on"])
+    run_networksetup(["-setsecurewebproxystate", selected, "on"])
+    return {"ok": True, "service": selected, "proxy": f"{host}:{port}"}
+
+
+def parse_proxy_endpoint(value: str) -> tuple[str, int] | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    if "://" not in raw:
+        raw = "http://" + raw
+    parsed = urllib.parse.urlsplit(raw)
+    if not parsed.hostname or not parsed.port:
+        return None
+    return parsed.hostname, int(parsed.port)
+
+
+def saved_previous_proxy_endpoint(base: Path) -> tuple[str, int] | None:
+    state_path = system_proxy_state_path(base)
+    if not state_path.exists():
+        return None
+    try:
+        saved = read_json(state_path)
+    except Exception:
+        return None
+    previous = saved.get("previous") if isinstance(saved.get("previous"), dict) else {}
+    for key in ("web", "secure_web"):
+        item = previous.get(key) if isinstance(previous.get(key), dict) else {}
+        if not item.get("enabled_bool"):
+            continue
+        host = str(item.get("server") or "").strip()
+        try:
+            port = int(item.get("port") or 0)
+        except (TypeError, ValueError):
+            port = 0
+        if host and port:
+            return host, port
+    return None
 
 
 def write_index_csv(run_dir: Path, articles: list[dict[str, Any]]) -> None:
@@ -3156,6 +3580,110 @@ def command_proxy_service_stop(args: argparse.Namespace) -> int:
     return 0 if result.get("ok") else 3
 
 
+def command_proxy_enhancer_start(args: argparse.Namespace) -> int:
+    base = runtime_dir(args.runtime_dir)
+    result = start_proxy_enhancer(base, args.port, args.upstream_proxy)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if result.get("ok") else 3
+
+
+def command_proxy_enhancer_status(args: argparse.Namespace) -> int:
+    base = runtime_dir(args.runtime_dir)
+    result = status_proxy_enhancer(base, args.port)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if result.get("ok") else 3
+
+
+def command_proxy_enhancer_stop(args: argparse.Namespace) -> int:
+    base = runtime_dir(args.runtime_dir)
+    result = stop_proxy_service(base, args.port, args.yes)
+    result["mode"] = "proxy-enhancer"
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if result.get("ok") else 3
+
+
+def command_proxy_enhancer_restart(args: argparse.Namespace) -> int:
+    base = runtime_dir(args.runtime_dir)
+    result = restart_proxy_enhancer_safely(base, args.port, args.upstream_proxy, args.yes)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if result.get("ok") else 3
+
+
+def command_proxy_enhancer_check_ingress(args: argparse.Namespace) -> int:
+    base = runtime_dir(args.runtime_dir)
+    result = proxy_enhancer_check_ingress(base, args.port, args.minutes)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if result.get("proxy_running") and result.get("article_ingress_detected") else 1
+
+
+def command_proxy_enhancer_logs(args: argparse.Namespace) -> int:
+    base = runtime_dir(args.runtime_dir)
+    result = proxy_enhancer_logs(base, args.hours, args.limit)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def command_proxy_enhancer_route_help(args: argparse.Namespace) -> int:
+    base = runtime_dir(args.runtime_dir)
+    result = proxy_enhancer_route_help(base, args.port)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def command_proxy_enhancer_session_start(args: argparse.Namespace) -> int:
+    base = runtime_dir(args.runtime_dir)
+    result = start_proxy_enhancer_session(base, args.port, args.upstream_proxy, args.yes)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if result.get("ok") else 3
+
+
+def command_proxy_enhancer_session_finish(args: argparse.Namespace) -> int:
+    base = runtime_dir(args.runtime_dir)
+    result = finish_proxy_enhancer_session(base, args.yes)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if result.get("ok") else 3
+
+
+def command_snapshot_list(args: argparse.Namespace) -> int:
+    base = runtime_dir(args.runtime_dir)
+    result = list_auto_snapshots(base, args.limit)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def command_snapshot_latest(args: argparse.Namespace) -> int:
+    base = runtime_dir(args.runtime_dir)
+    latest = latest_auto_snapshot(base)
+    result = {
+        "ok": bool(latest),
+        "mode": "proxy-enhancer",
+        "snapshot": latest,
+        "next_step": "Open an article through the enhancer and click 保存快照." if not latest else "Use snapshot-extract latest to create structured files.",
+    }
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if latest else 3
+
+
+def command_snapshot_export(args: argparse.Namespace) -> int:
+    base = runtime_dir(args.runtime_dir)
+    try:
+        result = export_auto_snapshot(base, args.snapshot_id, args.output_dir)
+    except Exception as exc:
+        result = {"ok": False, "error": str(exc), "snapshot_id": args.snapshot_id}
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if result.get("ok") else 3
+
+
+def command_snapshot_extract(args: argparse.Namespace) -> int:
+    base = runtime_dir(args.runtime_dir)
+    try:
+        result = extract_auto_snapshot(base, args.snapshot_id, args.output_dir)
+    except Exception as exc:
+        result = {"ok": False, "error": str(exc), "snapshot_id": args.snapshot_id}
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if result.get("ok") else 3
+
+
 def prepare_history_capture(
     base: Path,
     sample_url: str,
@@ -3296,6 +3824,413 @@ def finish_history_capture(base: Path, session_id: str, limit: int, yes: bool, s
     }
 
 
+def create_proxy_snapshot_session(base: Path, article_url: str) -> dict[str, Any]:
+    ensure_runtime(base)
+    cleaned = clean_url(article_url)
+    meta: dict[str, str] = {}
+    try:
+        raw = fetch_text(cleaned)
+        meta = extract_meta(raw, cleaned)
+    except Exception:
+        meta = {"title": "", "account": "", "author": "", "publish_time": "", "canonical_url": cleaned}
+    session_id = make_run_id()
+    run_dir = proxy_snapshot_dir(base, session_id)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    session = {
+        "ok": True,
+        "session_id": session_id,
+        "mode": "proxy-snapshot",
+        "status": "waiting_for_wechat_snapshot",
+        "created_at": utc_now(),
+        "expires_at": (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=2)).isoformat(),
+        "article_url": cleaned,
+        "sample_url": cleaned,
+        "title": meta.get("title", ""),
+        "account_name": meta.get("account", ""),
+        "author": meta.get("author", ""),
+        "publish_time": meta.get("publish_time", ""),
+        "run_dir": str(run_dir),
+        "raw_html": str(run_dir / "raw.html"),
+        "dom_html": str(run_dir / "dom.html"),
+        "body_txt": str(run_dir / "body.txt"),
+        "js_content_html": str(run_dir / "js_content.html"),
+        "comments_dom_html": str(run_dir / "comments_dom.html"),
+        "engagement_dom_html": str(run_dir / "engagement_dom.html"),
+        "snapshot_json": str(run_dir / "snapshot.json"),
+        "network_jsonl": str(run_dir / "network.jsonl"),
+        "metrics_json": str(run_dir / "metrics.json"),
+        "comments_json": str(run_dir / "comments.json"),
+        "style_profile_json": str(run_dir / "style_profile.json"),
+        "style_summary_md": str(run_dir / "style_summary.md"),
+        "report_md": str(run_dir / "report.md"),
+    }
+    save_history_session(base, session)
+    return session
+
+
+def prepare_proxy_snapshot(
+    base: Path,
+    article_url: str,
+    port: int,
+    upstream_proxy: str,
+    yes: bool,
+    copy: bool = True,
+) -> dict[str, Any]:
+    if not yes:
+        return {
+            "ok": False,
+            "requires_confirmation": True,
+            "command": "proxy-snapshot-prepare <article-url> --yes",
+            "next_step": f"Rerun with --yes to start/reuse 127.0.0.1:{port} and temporarily route HTTP/HTTPS traffic through it.",
+        }
+    setup = proxy_setup_status(port)
+    if not setup.get("ok"):
+        return {
+            "ok": False,
+            "stage": "setup",
+            "setup": setup,
+            "next_step": setup.get("next_step", "Install mitmproxy, then retry proxy-snapshot-prepare."),
+        }
+    session = create_proxy_snapshot_session(base, article_url)
+    proxy = start_history_proxy(base, session, port, 1, upstream_proxy)
+    if not proxy.get("ok"):
+        return {"ok": False, "stage": "proxy_start", "session_id": session["session_id"], "proxy": proxy}
+    proxy_already_enabled = system_proxy_points_to_port("", "127.0.0.1", port)
+    if proxy_already_enabled:
+        enable = {
+            "ok": True,
+            "already_enabled": True,
+            "proxy": f"127.0.0.1:{port}",
+            "message": "system proxy already points to the local WeChat proxy",
+        }
+    else:
+        enable = enable_system_proxy(base, "", "127.0.0.1", port, True)
+    if not enable.get("ok"):
+        return {"ok": False, "stage": "proxy_enable", "session_id": session["session_id"], "proxy": proxy, "enable": enable}
+    copied = False
+    clipboard_error = ""
+    if copy:
+        copied, message = copy_to_clipboard(session["article_url"])
+        if not copied:
+            clipboard_error = message
+    return {
+        "ok": True,
+        "mode": "proxy-snapshot",
+        "state": "waiting_for_button_click",
+        "session_id": session["session_id"],
+        "article_url": session["article_url"],
+        "title": session.get("title", ""),
+        "account_name": session.get("account_name", ""),
+        "run_dir": session["run_dir"],
+        "copied_to_clipboard": copied,
+        "clipboard_error": clipboard_error,
+        "proxy": f"127.0.0.1:{port}",
+        "upstream_proxy": proxy.get("upstream_proxy", ""),
+        "proxy_already_enabled": proxy_already_enabled,
+        "next_step": "Open article_url in the WeChat desktop built-in browser, wait until comments/metrics finish loading if needed, click 保存当前页面, then run proxy-snapshot-finish.",
+        "wechat_step": [
+            "Send article_url to WeChat File Transfer.",
+            "Open it with the WeChat desktop built-in browser.",
+            "Wait for the article, comments, and bottom interaction area to load.",
+            "Click the injected 保存当前页面 button.",
+            "Reply when finished so the Skill can run proxy-snapshot-finish.",
+        ],
+        "files": {
+            "snapshot_json": session["snapshot_json"],
+            "network_jsonl": session["network_jsonl"],
+            "report_md": session["report_md"],
+        },
+    }
+
+
+def proxy_snapshot_status(base: Path, session_id: str) -> dict[str, Any]:
+    session = load_history_session(base, session_id)
+    run_dir = Path(str(session.get("run_dir") or proxy_snapshot_dir(base, session_id))).expanduser()
+    ready_path = session_ready_marker(base, session_id)
+    marker = read_json(ready_path) if ready_path.exists() else {}
+    files = {
+        "raw_html": run_dir / "raw.html",
+        "dom_html": run_dir / "dom.html",
+        "snapshot_json": run_dir / "snapshot.json",
+        "network_jsonl": run_dir / "network.jsonl",
+        "metrics_json": run_dir / "metrics.json",
+        "comments_json": run_dir / "comments.json",
+        "style_profile_json": run_dir / "style_profile.json",
+        "report_md": run_dir / "report.md",
+    }
+    return {
+        "ok": True,
+        "mode": "proxy-snapshot",
+        "session_id": session_id,
+        "ready": bool(marker.get("ready")),
+        "status": marker.get("status", "waiting_for_button_click"),
+        "run_dir": str(run_dir),
+        "files": {name: str(path) for name, path in files.items() if path.exists()},
+        "missing_files": [name for name, path in files.items() if not path.exists()],
+        "report_md": str(files["report_md"]),
+        "next_step": (
+            "Run proxy-snapshot-finish to restore the system proxy."
+            if marker.get("ready")
+            else "Open the article in WeChat built-in browser and click 保存当前页面."
+        ),
+    }
+
+
+def finish_proxy_snapshot(base: Path, session_id: str, yes: bool, stop_proxy: bool = False) -> dict[str, Any]:
+    if not yes:
+        return {
+            "ok": False,
+            "requires_confirmation": True,
+            "command": "proxy-snapshot-finish <session-id> --yes",
+            "next_step": "Rerun with --yes to restore the system proxy. The local proxy service stays running by default.",
+        }
+    status = proxy_snapshot_status(base, session_id)
+    try:
+        restore = disable_system_proxy(base, yes=True)
+    except Exception as exc:
+        restore = {"ok": False, "error": str(exc)}
+    stop: dict[str, Any] = {"ok": True, "stopped": False, "kept_running": True}
+    if stop_proxy:
+        try:
+            stop = stop_history_proxy(base, session_id)
+        except Exception as exc:
+            stop = {"ok": False, "error": str(exc), "session_id": session_id}
+    return {
+        "ok": bool(restore.get("ok")) and bool(stop.get("ok")),
+        **status,
+        "restore": {
+            "ok": bool(restore.get("ok")),
+            "service": restore.get("service", ""),
+            "restored": restore.get("restored", False),
+            "error": restore.get("error", ""),
+        },
+        "proxy": {
+            "ok": bool(stop.get("ok")),
+            "stopped": bool(stop.get("stopped")),
+            "kept_running": bool(stop.get("kept_running")),
+            "error": stop.get("error", ""),
+        },
+    }
+
+
+def load_auto_snapshots(base: Path) -> list[dict[str, Any]]:
+    index_path = auto_snapshot_index_path(base)
+    if not index_path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    with index_path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+    rows.sort(key=lambda row: str(row.get("captured_at") or row.get("created_at") or ""), reverse=True)
+    return rows
+
+
+def latest_auto_snapshot(base: Path) -> dict[str, Any]:
+    rows = load_auto_snapshots(base)
+    return rows[0] if rows else {}
+
+
+def list_auto_snapshots(base: Path, limit: int) -> dict[str, Any]:
+    rows = load_auto_snapshots(base)
+    shown = rows[: max(limit, 1)]
+    return {
+        "ok": True,
+        "mode": "proxy-enhancer",
+        "snapshot_root": str(auto_snapshot_root(base)),
+        "snapshot_index": str(auto_snapshot_index_path(base)),
+        "total_count": len(rows),
+        "shown_count": len(shown),
+        "snapshots": shown,
+    }
+
+
+def get_auto_snapshot(base: Path, snapshot_id: str) -> dict[str, Any]:
+    for row in load_auto_snapshots(base):
+        if str(row.get("snapshot_id") or "") == snapshot_id:
+            return row
+    raise FileNotFoundError(f"snapshot not found: {snapshot_id}")
+
+
+def export_auto_snapshot(base: Path, snapshot_id: str, output_dir: str = "") -> dict[str, Any]:
+    row = get_auto_snapshot(base, snapshot_id)
+    source_dir = Path(str(row.get("run_dir") or "")).expanduser()
+    if not source_dir.exists() or not source_dir.is_dir():
+        raise FileNotFoundError(f"snapshot directory not found: {source_dir}")
+    if not output_dir:
+        return {
+            "ok": True,
+            "mode": "proxy-enhancer",
+            "snapshot_id": snapshot_id,
+            "run_dir": str(source_dir),
+            "copied": False,
+            "files": sorted(path.name for path in source_dir.iterdir() if path.is_file()),
+        }
+    destination_root = Path(output_dir).expanduser()
+    destination = destination_root / snapshot_id
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source_dir, destination, dirs_exist_ok=True)
+    return {
+        "ok": True,
+        "mode": "proxy-enhancer",
+        "snapshot_id": snapshot_id,
+        "run_dir": str(source_dir),
+        "output_dir": str(destination),
+        "copied": True,
+    }
+
+
+def image_sources_from_html(value: str) -> list[str]:
+    sources: list[str] = []
+    seen: set[str] = set()
+    for match in IMG_RE.finditer(value or ""):
+        attrs = attr_map(match.group(0))
+        src = attrs.get("data-local-src") or attrs.get("data-src") or attrs.get("src") or ""
+        src = html.unescape(src).strip()
+        if not src or src in seen:
+            continue
+        seen.add(src)
+        sources.append(src)
+    return sources
+
+
+def comments_from_dom(value: str) -> dict[str, Any]:
+    text = strip_tags(value or "")
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return {
+        "complete": False,
+        "source": "dom",
+        "reason": "only_comments_loaded_in_the_page_at_snapshot_time_are_available",
+        "html_present": bool((value or "").strip()),
+        "text_line_count": len(lines),
+        "text_lines": lines,
+        "html": value or "",
+    }
+
+
+def read_text_if_exists(path: Path) -> str:
+    return path.read_text(encoding="utf-8") if path.exists() else ""
+
+
+def snapshot_id_or_latest(base: Path, snapshot_id: str) -> str:
+    if snapshot_id and snapshot_id != "latest":
+        return snapshot_id
+    latest = latest_auto_snapshot(base)
+    resolved = str(latest.get("snapshot_id") or "")
+    if not resolved:
+        raise FileNotFoundError("no snapshots found")
+    return resolved
+
+
+def extract_auto_snapshot(base: Path, snapshot_id: str = "latest", output_dir: str = "") -> dict[str, Any]:
+    resolved_id = snapshot_id_or_latest(base, snapshot_id)
+    row = get_auto_snapshot(base, resolved_id)
+    run_dir = Path(str(row.get("run_dir") or "")).expanduser()
+    if not run_dir.exists() or not run_dir.is_dir():
+        raise FileNotFoundError(f"snapshot directory not found: {run_dir}")
+    out_dir = Path(output_dir).expanduser().resolve() if output_dir else run_dir / "extracted"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    snapshot_path = run_dir / "snapshot.json"
+    snapshot = read_json(snapshot_path) if snapshot_path.exists() else {}
+    js_content_html = str(snapshot.get("js_content_html") or read_text_if_exists(run_dir / "js_content.html"))
+    comments_html = str(snapshot.get("comments_dom_html") or read_text_if_exists(run_dir / "comments_dom.html"))
+    engagement_html = str(snapshot.get("engagement_dom_html") or read_text_if_exists(run_dir / "engagement_dom.html"))
+    title = str(snapshot.get("title") or row.get("title") or "微信文章").strip()
+    account_name = str(snapshot.get("account_name") or row.get("account_name") or "").strip()
+    author = str(snapshot.get("author") or row.get("author") or "").strip()
+    publish_time = str(snapshot.get("publish_time") or row.get("publish_time") or "").strip()
+    raw_url = str(snapshot.get("url") or row.get("url") or "")
+    try:
+        url = clean_url(raw_url) if raw_url else ""
+    except ValueError:
+        url = safe_display_url(raw_url)
+
+    metrics_path = run_dir / "metrics.json"
+    style_path = run_dir / "style_profile.json"
+    metrics = read_json(metrics_path) if metrics_path.exists() else {}
+    style_profile = read_json(style_path) if style_path.exists() else {}
+    comments = comments_from_dom(comments_html)
+    image_sources = image_sources_from_html(js_content_html)
+
+    article_md = "\n".join(
+        [
+            "---",
+            f"title: {title}",
+            f"account: {account_name}",
+            f"author: {author}",
+            f"publish_time: {publish_time}",
+            f"url: {url}",
+            f"snapshot_id: {resolved_id}",
+            "---",
+            "",
+            f"# {title}",
+            "",
+            html_to_markdown(js_content_html).strip(),
+            "",
+        ]
+    )
+    (out_dir / "article.md").write_text(article_md, encoding="utf-8")
+    write_json(out_dir / "comments.json", comments)
+    write_json(out_dir / "metrics.json", metrics)
+    write_json(out_dir / "style_profile.json", style_profile)
+    write_json(out_dir / "image_urls.json", {"count": len(image_sources), "images": image_sources})
+    (out_dir / "engagement.html").write_text(engagement_html, encoding="utf-8")
+    report = "\n".join(
+        [
+            "# 快照提取报告",
+            "",
+            f"- 标题：{title or 'missing'}",
+            f"- 公众号：{account_name or 'missing'}",
+            f"- 发布时间：{publish_time or 'missing'}",
+            f"- URL：{url or 'missing'}",
+            f"- Snapshot ID：{resolved_id}",
+            "",
+            "## 产物",
+            "",
+            "- article.md：正文 Markdown",
+            "- comments.json：已加载评论文本和原始评论 DOM",
+            "- metrics.json：可观察互动数据",
+            "- style_profile.json：页面风格特征",
+            "- image_urls.json：正文图片 URL 列表",
+            "- engagement.html：互动区域 DOM",
+            "",
+            "## 边界",
+            "",
+            "- 评论只包含点击保存快照时页面已加载的内容。",
+            "- 图片默认只提取 URL，不在 extract 阶段下载。",
+            "- 互动数据只来自页面 DOM/文本可观察结果，缺失字段不推断。",
+            "",
+        ]
+    )
+    (out_dir / "report.md").write_text(report, encoding="utf-8")
+    return {
+        "ok": True,
+        "mode": "proxy-enhancer",
+        "snapshot_id": resolved_id,
+        "run_dir": str(run_dir),
+        "output_dir": str(out_dir),
+        "files": {
+            "article_md": str(out_dir / "article.md"),
+            "comments_json": str(out_dir / "comments.json"),
+            "metrics_json": str(out_dir / "metrics.json"),
+            "style_profile_json": str(out_dir / "style_profile.json"),
+            "image_urls_json": str(out_dir / "image_urls.json"),
+            "engagement_html": str(out_dir / "engagement.html"),
+            "report_md": str(out_dir / "report.md"),
+        },
+        "comments_complete": False,
+        "image_count": len(image_sources),
+    }
+
+
 def command_history_capture_prepare(args: argparse.Namespace) -> int:
     base = runtime_dir(args.runtime_dir)
     try:
@@ -3309,6 +4244,33 @@ def command_history_capture_prepare(args: argparse.Namespace) -> int:
 def command_history_capture_finish(args: argparse.Namespace) -> int:
     base = runtime_dir(args.runtime_dir)
     result = finish_history_capture(base, args.session_id, args.limit, args.yes, args.stop_proxy)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if result.get("ok") else 3
+
+
+def command_proxy_snapshot_prepare(args: argparse.Namespace) -> int:
+    base = runtime_dir(args.runtime_dir)
+    try:
+        result = prepare_proxy_snapshot(base, args.article_url, args.port, args.upstream_proxy, args.yes, not args.no_copy)
+    except (ValueError, RuntimeError, subprocess.CalledProcessError, urllib.error.URLError) as exc:
+        result = {"ok": False, "error": str(exc)}
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if result.get("ok") else 3
+
+
+def command_proxy_snapshot_status(args: argparse.Namespace) -> int:
+    base = runtime_dir(args.runtime_dir)
+    try:
+        result = proxy_snapshot_status(base, args.session_id)
+    except Exception as exc:
+        result = {"ok": False, "error": str(exc), "session_id": args.session_id}
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if result.get("ok") else 3
+
+
+def command_proxy_snapshot_finish(args: argparse.Namespace) -> int:
+    base = runtime_dir(args.runtime_dir)
+    result = finish_proxy_snapshot(base, args.session_id, args.yes, args.stop_proxy)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if result.get("ok") else 3
 
@@ -3537,6 +4499,117 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--yes", action="store_true", help="Actually restore macOS proxy settings")
     p.add_argument("--stop-proxy", action="store_true", help="Also stop the local proxy process")
     p.set_defaults(func=command_history_capture_finish)
+
+    p = sub.add_parser("proxy-snapshot-prepare", help="Deprecated debug path: prepare one guided article snapshot session")
+    p.add_argument("--runtime-dir", default=argparse.SUPPRESS, help="Override runtime directory")
+    p.add_argument("article_url")
+    p.add_argument("--port", type=int, default=DEFAULT_PROXY_PORT)
+    p.add_argument(
+        "--upstream-proxy",
+        default="auto",
+        help="Upstream HTTP proxy for mitmproxy. Use auto to chain the current macOS HTTP proxy.",
+    )
+    p.add_argument("--yes", action="store_true", help="Deprecated: start/reuse the proxy and modify macOS proxy settings")
+    p.add_argument("--no-copy", action="store_true", help="Print the article URL without copying it to clipboard")
+    p.set_defaults(func=command_proxy_snapshot_prepare)
+
+    p = sub.add_parser("proxy-snapshot-status", help="Check one WeChat article DOM snapshot session")
+    p.add_argument("--runtime-dir", default=argparse.SUPPRESS, help="Override runtime directory")
+    p.add_argument("session_id")
+    p.set_defaults(func=command_proxy_snapshot_status)
+
+    p = sub.add_parser("proxy-snapshot-finish", help="Finish WeChat article DOM snapshot and restore proxy")
+    p.add_argument("--runtime-dir", default=argparse.SUPPRESS, help="Override runtime directory")
+    p.add_argument("session_id")
+    p.add_argument("--yes", action="store_true", help="Actually restore macOS proxy settings")
+    p.add_argument("--stop-proxy", action="store_true", help="Also stop the local proxy process")
+    p.set_defaults(func=command_proxy_snapshot_finish)
+
+    p = sub.add_parser("proxy-enhancer-start", help="Start persistent WeChat article enhancer proxy without changing system proxy")
+    p.add_argument("--runtime-dir", default=argparse.SUPPRESS, help="Override runtime directory")
+    p.add_argument("--port", type=int, default=DEFAULT_PROXY_PORT)
+    p.add_argument(
+        "--upstream-proxy",
+        default="auto",
+        help="Upstream HTTP proxy. Use auto to chain the current macOS HTTP proxy.",
+    )
+    p.set_defaults(func=command_proxy_enhancer_start)
+
+    p = sub.add_parser("proxy-enhancer-status", help="Check persistent WeChat article enhancer proxy")
+    p.add_argument("--runtime-dir", default=argparse.SUPPRESS, help="Override runtime directory")
+    p.add_argument("--port", type=int, default=DEFAULT_PROXY_PORT)
+    p.set_defaults(func=command_proxy_enhancer_status)
+
+    p = sub.add_parser("proxy-enhancer-stop", help="Stop persistent WeChat article enhancer proxy")
+    p.add_argument("--runtime-dir", default=argparse.SUPPRESS, help="Override runtime directory")
+    p.add_argument("--port", type=int, default=DEFAULT_PROXY_PORT)
+    p.add_argument("--yes", action="store_true", help="Actually stop the local proxy service")
+    p.set_defaults(func=command_proxy_enhancer_stop)
+
+    p = sub.add_parser("proxy-enhancer-restart", help="Safely restart enhancer without leaving system proxy on a dead port")
+    p.add_argument("--runtime-dir", default=argparse.SUPPRESS, help="Override runtime directory")
+    p.add_argument("--port", type=int, default=DEFAULT_PROXY_PORT)
+    p.add_argument(
+        "--upstream-proxy",
+        default="auto",
+        help="Upstream HTTP proxy. Use auto to chain the current macOS HTTP proxy after temporary bypass.",
+    )
+    p.add_argument("--yes", action="store_true", help="Actually restart the local proxy service")
+    p.set_defaults(func=command_proxy_enhancer_restart)
+
+    p = sub.add_parser("proxy-enhancer-check-ingress", help="Check whether WeChat article traffic reached 23344")
+    p.add_argument("--runtime-dir", default=argparse.SUPPRESS, help="Override runtime directory")
+    p.add_argument("--port", type=int, default=DEFAULT_PROXY_PORT)
+    p.add_argument("--minutes", type=int, default=10, help="Recent window to inspect")
+    p.set_defaults(func=command_proxy_enhancer_check_ingress)
+
+    p = sub.add_parser("proxy-enhancer-logs", help="Show recent proxy-enhancer debug events")
+    p.add_argument("--runtime-dir", default=argparse.SUPPRESS, help="Override runtime directory")
+    p.add_argument("--hours", type=int, default=24, help="Recent window to inspect, capped at 24 hours")
+    p.add_argument("--limit", type=int, default=80, help="Maximum events to print")
+    p.set_defaults(func=command_proxy_enhancer_logs)
+
+    p = sub.add_parser("proxy-enhancer-route-help", help="Show local routing facts for WeChat -> 23344 -> upstream")
+    p.add_argument("--runtime-dir", default=argparse.SUPPRESS, help="Override runtime directory")
+    p.add_argument("--port", type=int, default=DEFAULT_PROXY_PORT)
+    p.set_defaults(func=command_proxy_enhancer_route_help)
+
+    p = sub.add_parser("proxy-enhancer-session-start", help="Route system HTTP/HTTPS proxy to the persistent enhancer")
+    p.add_argument("--runtime-dir", default=argparse.SUPPRESS, help="Override runtime directory")
+    p.add_argument("--port", type=int, default=DEFAULT_PROXY_PORT)
+    p.add_argument(
+        "--upstream-proxy",
+        default="auto",
+        help="Upstream HTTP proxy. Use auto to chain the current macOS HTTP proxy.",
+    )
+    p.add_argument("--yes", action="store_true", help="Actually modify macOS HTTP/HTTPS proxy settings")
+    p.set_defaults(func=command_proxy_enhancer_session_start)
+
+    p = sub.add_parser("proxy-enhancer-session-finish", help="Restore system HTTP/HTTPS proxy after enhancer session")
+    p.add_argument("--runtime-dir", default=argparse.SUPPRESS, help="Override runtime directory")
+    p.add_argument("--yes", action="store_true", help="Actually restore saved macOS HTTP/HTTPS proxy settings")
+    p.set_defaults(func=command_proxy_enhancer_session_finish)
+
+    p = sub.add_parser("snapshot-list", help="List recent snapshots captured by proxy-enhancer")
+    p.add_argument("--runtime-dir", default=argparse.SUPPRESS, help="Override runtime directory")
+    p.add_argument("--limit", type=int, default=10)
+    p.set_defaults(func=command_snapshot_list)
+
+    p = sub.add_parser("snapshot-latest", help="Show the latest snapshot captured by proxy-enhancer")
+    p.add_argument("--runtime-dir", default=argparse.SUPPRESS, help="Override runtime directory")
+    p.set_defaults(func=command_snapshot_latest)
+
+    p = sub.add_parser("snapshot-export", help="Export or inspect one proxy-enhancer snapshot")
+    p.add_argument("--runtime-dir", default=argparse.SUPPRESS, help="Override runtime directory")
+    p.add_argument("snapshot_id")
+    p.add_argument("--output-dir", default="", help="Optional destination directory")
+    p.set_defaults(func=command_snapshot_export)
+
+    p = sub.add_parser("snapshot-extract", help="Extract one proxy-enhancer snapshot into structured files")
+    p.add_argument("--runtime-dir", default=argparse.SUPPRESS, help="Override runtime directory")
+    p.add_argument("snapshot_id", nargs="?", default="latest", help="Snapshot id, or latest")
+    p.add_argument("--output-dir", default="", help="Optional destination directory")
+    p.set_defaults(func=command_snapshot_extract)
 
     p = sub.add_parser("adapter-watch", help="Wait for WeChat desktop context and fetch history rows when ready")
     p.add_argument("--runtime-dir", default=argparse.SUPPRESS, help="Override runtime directory")
