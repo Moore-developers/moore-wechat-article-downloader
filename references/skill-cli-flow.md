@@ -252,6 +252,7 @@ python3 scripts/wechat_downloader.py snapshot-attach --all-unprocessed
     `-- snapshots/<snapshot-id>/
         |-- article.md
         |-- comments.json
+        |-- comments_structured.json
         |-- metrics.json
         |-- style_profile.json
         |-- image_urls.json
@@ -260,6 +261,18 @@ python3 scripts/wechat_downloader.py snapshot-attach --all-unprocessed
 ```
 
 If the article was not previously downloaded, `snapshot-attach` creates a Markdown article from the snapshot body and adds an `index.csv` row with `source_mode=snapshot`.
+
+The user-facing Markdown article must also contain a replaceable page-data section:
+
+```markdown
+<!-- moore-wechat-page-data:start -->
+## 页面数据
+
+...
+<!-- moore-wechat-page-data:end -->
+```
+
+This section includes observable metrics and a structured loaded-comments table. Re-attaching the same article replaces this section instead of appending duplicate sections.
 
 Do not attach raw snapshot directories recursively. The attach step only copies structured extraction output into the user-facing article library.
 

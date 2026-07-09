@@ -168,6 +168,7 @@ python3 {baseDir}/scripts/wechat_downloader.py snapshot-attach --all-unprocessed
 
 - 已下载过的文章：按 URL/微信文章参数匹配，增强数据放到对应公众号目录。
 - 没下载过的文章：从快照正文生成 Markdown，也放到 `~/Downloads/wechat-articles/<公众号名>/`。
+- 评论、阅读数、点赞数、收藏数等页面数据必须写进文章 Markdown 的 `## 页面数据` 区块；同一篇文章重复归档时替换旧区块，不重复追加。
 - 同一篇文章多次保存：保留每次快照，并更新 `latest.json` 和 `metrics_history.jsonl`。
 - 不递归复制原始快照目录；只归档结构化提取产物，避免把敏感或调试文件带进文章库。
 
@@ -205,6 +206,7 @@ python3 {baseDir}/scripts/wechat_downloader.py snapshot-extract <snapshot-id> --
 
 - `article.md`：正文 Markdown
 - `comments.json`：已加载评论文本和原始评论 DOM，`complete=false`
+- `comments_structured.json`：结构化评论，包含昵称、地区/时间、点赞、回复数、内容
 - `metrics.json`：可观察互动数据
 - `style_profile.json`：页面风格特征
 - `image_urls.json`：正文图片 URL 列表

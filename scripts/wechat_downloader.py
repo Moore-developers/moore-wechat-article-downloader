@@ -4119,6 +4119,154 @@ def comments_from_dom(value: str) -> dict[str, Any]:
     }
 
 
+COMMENT_UI_NOISE = {
+    "保存中...",
+    "转发",
+    "翻译",
+    "不喜欢",
+    "投诉",
+    "首评",
+    "暂无留言",
+    "已无更多数据",
+}
+COMMENT_SUMMARY_RE = re.compile(r"^(?:留言\s*)?\d+\s*$")
+COMMENT_MESSAGE_SUMMARY_RE = re.compile(r"^\d+\s*条留言$")
+COMMENT_LIKE_RE = re.compile(r"^赞\s*(\d*)$")
+COMMENT_REPLY_RE = re.compile(r"^(\d+)\s*条回复$")
+COMMENT_LOCATION_TIME_RE = re.compile(
+    r"^([\u4e00-\u9fa5A-Za-z]{1,12})"
+    r"((?:\d{4}年)?\d{1,2}月\d{1,2}日|昨天|今天|\d+\s*(?:分钟前|小时前|天前))$"
+)
+COMMENT_AUTHOR_TIME_RE = re.compile(
+    r"^作者\s*((?:\d{4}年)?\d{1,2}月\d{1,2}日|昨天|今天|刚刚|\d+\s*(?:分钟前|小时前|天前))$"
+)
+
+
+def split_comment_location_time(value: str) -> tuple[str, str] | None:
+    stripped = value.strip()
+    author_match = COMMENT_AUTHOR_TIME_RE.match(stripped)
+    if author_match:
+        return "", author_match.group(1).replace(" ", "")
+    match = COMMENT_LOCATION_TIME_RE.match(stripped)
+    if not match:
+        return None
+    return match.group(1), match.group(2).replace(" ", "")
+
+
+def is_comment_noise(line: str) -> bool:
+    if line in COMMENT_UI_NOISE:
+        return True
+    if COMMENT_SUMMARY_RE.match(line):
+        return True
+    if COMMENT_MESSAGE_SUMMARY_RE.match(line):
+        return True
+    if line.startswith("留言 ") and COMMENT_SUMMARY_RE.match(line.replace("留言", "", 1).strip()):
+        return True
+    return False
+
+
+def parse_comment_like(line: str) -> int | None:
+    match = COMMENT_LIKE_RE.match(line.strip())
+    if not match:
+        return None
+    return int(match.group(1) or "0")
+
+
+def parse_comment_reply_count(line: str) -> int | None:
+    match = COMMENT_REPLY_RE.match(line.strip())
+    return int(match.group(1)) if match else None
+
+
+def structured_comments_from_text_lines(lines: list[Any]) -> dict[str, Any]:
+    cleaned = [clean_comment_line(line) for line in lines]
+    cleaned = [line for line in cleaned if line]
+    comments: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    seen: set[str] = set()
+
+    def flush() -> None:
+        nonlocal current
+        if not current:
+            return
+        content = str(current.get("content") or "").strip()
+        author = str(current.get("author") or "").strip()
+        if not content or not author:
+            current = None
+            return
+        key = "|".join(
+            [
+                author,
+                str(current.get("location") or ""),
+                str(current.get("time") or ""),
+                str(current.get("like_count") if current.get("like_count") is not None else ""),
+                content,
+            ]
+        )
+        if key not in seen:
+            seen.add(key)
+            comments.append(current)
+        current = None
+
+    i = 0
+    while i < len(cleaned):
+        line = cleaned[i]
+        if is_comment_noise(line):
+            i += 1
+            continue
+        location_time = split_comment_location_time(line)
+        if location_time and i > 0:
+            author = cleaned[i - 1]
+            if author and not is_comment_noise(author) and parse_comment_like(author) is None:
+                flush()
+                location, time_value = location_time
+                current = {
+                    "author": author,
+                    "location": location,
+                    "time": time_value,
+                    "like_count": 0,
+                    "reply_count": 0,
+                    "content": "",
+                    "is_author": line.strip().startswith("作者"),
+                    "replies": [],
+                }
+            i += 1
+            continue
+        if not current:
+            i += 1
+            continue
+        if i + 1 < len(cleaned) and split_comment_location_time(cleaned[i + 1]):
+            flush()
+            continue
+        like_count = parse_comment_like(line)
+        if like_count is not None:
+            current["like_count"] = like_count
+            i += 1
+            continue
+        reply_count = parse_comment_reply_count(line)
+        if reply_count is not None:
+            current["reply_count"] = reply_count
+            i += 1
+            continue
+        if line == "作者":
+            current["is_author"] = True
+            i += 1
+            continue
+        if split_comment_location_time(line):
+            flush()
+            continue
+        existing = str(current.get("content") or "").strip()
+        current["content"] = f"{existing}\n{line}".strip() if existing else line
+        i += 1
+    flush()
+    return {
+        "complete": False,
+        "source": "text_lines_heuristic",
+        "reason": "only_comments_loaded_in_the_page_at_snapshot_time_are_available",
+        "count": len(comments),
+        "comments": comments,
+    }
+
+
 def read_text_if_exists(path: Path) -> str:
     return path.read_text(encoding="utf-8") if path.exists() else ""
 
@@ -4162,6 +4310,7 @@ def extract_auto_snapshot(base: Path, snapshot_id: str = "latest", output_dir: s
     metrics = read_json(metrics_path) if metrics_path.exists() else {}
     style_profile = read_json(style_path) if style_path.exists() else {}
     comments = comments_from_dom(comments_html)
+    structured_comments = structured_comments_from_text_lines(comments.get("text_lines", []))
     image_sources = image_sources_from_html(js_content_html)
 
     article_md = "\n".join(
@@ -4183,6 +4332,7 @@ def extract_auto_snapshot(base: Path, snapshot_id: str = "latest", output_dir: s
     )
     (out_dir / "article.md").write_text(article_md, encoding="utf-8")
     write_json(out_dir / "comments.json", comments)
+    write_json(out_dir / "comments_structured.json", structured_comments)
     write_json(out_dir / "metrics.json", metrics)
     write_json(out_dir / "style_profile.json", style_profile)
     write_json(out_dir / "image_urls.json", {"count": len(image_sources), "images": image_sources})
@@ -4201,6 +4351,7 @@ def extract_auto_snapshot(base: Path, snapshot_id: str = "latest", output_dir: s
             "",
             "- article.md：正文 Markdown",
             "- comments.json：已加载评论文本和原始评论 DOM",
+            "- comments_structured.json：结构化评论列表",
             "- metrics.json：可观察互动数据",
             "- style_profile.json：页面风格特征",
             "- image_urls.json：正文图片 URL 列表",
@@ -4224,6 +4375,7 @@ def extract_auto_snapshot(base: Path, snapshot_id: str = "latest", output_dir: s
         "files": {
             "article_md": str(out_dir / "article.md"),
             "comments_json": str(out_dir / "comments.json"),
+            "comments_structured_json": str(out_dir / "comments_structured.json"),
             "metrics_json": str(out_dir / "metrics.json"),
             "style_profile_json": str(out_dir / "style_profile.json"),
             "image_urls_json": str(out_dir / "image_urls.json"),
@@ -4231,6 +4383,7 @@ def extract_auto_snapshot(base: Path, snapshot_id: str = "latest", output_dir: s
             "report_md": str(out_dir / "report.md"),
         },
         "comments_complete": False,
+        "structured_comment_count": structured_comments.get("count", 0),
         "image_count": len(image_sources),
     }
 
@@ -4454,9 +4607,159 @@ def metrics_flat(metrics: dict[str, Any]) -> dict[str, Any]:
     return flat
 
 
+PAGE_DATA_START = "<!-- moore-wechat-page-data:start -->"
+PAGE_DATA_END = "<!-- moore-wechat-page-data:end -->"
+
+
+def metric_value_and_source(metrics: dict[str, Any], key: str) -> tuple[str, str]:
+    value = metrics.get(key)
+    if isinstance(value, dict):
+        raw_value = value.get("value")
+        source = str(value.get("source") or "")
+    else:
+        raw_value = value
+        source = ""
+    display = "missing" if raw_value is None or raw_value == "" else str(raw_value)
+    return display, source or ("missing" if display == "missing" else "snapshot")
+
+
+def markdown_cell(value: Any) -> str:
+    return str(value).replace("|", "\\|").replace("\n", " ").strip()
+
+
+def clean_comment_line(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value)).strip()
+
+
+def render_page_data_markdown(
+    meta: dict[str, Any],
+    metrics: dict[str, Any],
+    comments: dict[str, Any],
+    structured_comments: dict[str, Any],
+    attached_at: str,
+) -> str:
+    metric_labels = [
+        ("read_count", "阅读数"),
+        ("like_count", "点赞数"),
+        ("old_like_count", "在看数"),
+        ("comment_count", "评论数"),
+        ("favorite_count", "收藏数"),
+        ("share_count", "分享数"),
+    ]
+    lines = [
+        PAGE_DATA_START,
+        "",
+        "## 页面数据",
+        "",
+        f"- 保存时间：{attached_at or 'missing'}",
+        f"- 快照 ID：{meta.get('snapshot_id') or 'missing'}",
+        "- 数据边界：只包含点击“保存这篇”时页面已经加载和暴露的内容；页面没暴露的数据标记为 `missing`。",
+        "",
+        "### 互动数据",
+        "",
+        "| 字段 | 值 | 来源 |",
+        "|---|---:|---|",
+    ]
+    for key, label in metric_labels:
+        value, source = metric_value_and_source(metrics, key)
+        lines.append(f"| {label} | {markdown_cell(value)} | {markdown_cell(source)} |")
+
+    text_lines = comments.get("text_lines") if isinstance(comments, dict) else []
+    if not isinstance(text_lines, list):
+        text_lines = []
+    cleaned_lines = [
+        line
+        for line in (clean_comment_line(item) for item in text_lines)
+        if line and not is_comment_noise(line)
+    ]
+    structured_items = structured_comments.get("comments") if isinstance(structured_comments, dict) else []
+    if not isinstance(structured_items, list):
+        structured_items = []
+    line_count = comments.get("text_line_count", len(cleaned_lines)) if isinstance(comments, dict) else len(cleaned_lines)
+    complete = bool(comments.get("complete")) if isinstance(comments, dict) else False
+    reason = str(comments.get("reason") or "") if isinstance(comments, dict) else ""
+
+    lines.extend(
+        [
+            "",
+            "### 已加载评论",
+            "",
+            f"- 完整性：{'完整' if complete else '不完整，仅页面已加载'}",
+            f"- 结构化评论数：{len(structured_items)}",
+            f"- 原始文本行数：{line_count}",
+        ]
+    )
+    if reason:
+        lines.append(f"- 说明：{reason}")
+    if structured_items:
+        lines.extend(
+            [
+                "",
+                "| 序号 | 昵称 | 地区/时间 | 点赞 | 回复 | 评论 |",
+                "|---:|---|---|---:|---:|---|",
+            ]
+        )
+        for index, item in enumerate(structured_items, start=1):
+            if not isinstance(item, dict):
+                continue
+            location_time = " · ".join(
+                part
+                for part in [str(item.get("location") or "").strip(), str(item.get("time") or "").strip()]
+                if part
+            )
+            author = str(item.get("author") or "missing").strip()
+            if item.get("is_author"):
+                author = f"{author}（作者）"
+            like_count = item.get("like_count")
+            reply_count = item.get("reply_count")
+            content = str(item.get("content") or "").strip()
+            content = re.sub(r"\s*\n\s*", "<br>", content)
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        str(index),
+                        markdown_cell(author),
+                        markdown_cell(location_time or "missing"),
+                        markdown_cell(0 if like_count in {None, ""} else like_count),
+                        markdown_cell(0 if reply_count in {None, ""} else reply_count),
+                        markdown_cell(content or "missing"),
+                    ]
+                )
+                + " |"
+            )
+    elif cleaned_lines:
+        lines.extend(["", "> 未能稳定解析评论结构，以下为清洗后的页面文本。", ""])
+        lines.append("")
+        for line in cleaned_lines:
+            lines.append(f"- {line}")
+    else:
+        lines.extend(["", "- missing"])
+    lines.extend(["", PAGE_DATA_END, ""])
+    return "\n".join(lines)
+
+
+def upsert_page_data_section(markdown_path: Path, page_data: str) -> bool:
+    if not markdown_path.exists():
+        return False
+    current = markdown_path.read_text(encoding="utf-8")
+    block_re = re.compile(
+        rf"\n*{re.escape(PAGE_DATA_START)}.*?{re.escape(PAGE_DATA_END)}\n*",
+        re.S,
+    )
+    if block_re.search(current):
+        updated = block_re.sub("\n\n" + page_data.strip() + "\n", current).rstrip() + "\n"
+    else:
+        updated = current.rstrip() + "\n\n" + page_data.strip() + "\n"
+    if updated != current:
+        markdown_path.write_text(updated, encoding="utf-8")
+    return True
+
+
 SNAPSHOT_ATTACH_FILES = [
     "article.md",
     "comments.json",
+    "comments_structured.json",
     "metrics.json",
     "style_profile.json",
     "image_urls.json",
@@ -4557,9 +4860,18 @@ def attach_auto_snapshot(
     metrics = read_json(metrics_path) if metrics_path.exists() else {}
     comments_path = extracted_dir / "comments.json"
     comments = read_json(comments_path) if comments_path.exists() else {}
+    structured_comments_path = extracted_dir / "comments_structured.json"
+    structured_comments = (
+        read_json(structured_comments_path)
+        if structured_comments_path.exists()
+        else structured_comments_from_text_lines(comments.get("text_lines", []) if isinstance(comments, dict) else [])
+    )
+    attached_at = utc_now()
+    page_data = render_page_data_markdown(meta, metrics, comments, structured_comments, attached_at)
+    markdown_embedded = False
     latest = {
         "snapshot_id": snapshot_id,
-        "attached_at": utc_now(),
+        "attached_at": attached_at,
         "captured_at": meta.get("captured_at", ""),
         "title": title,
         "account_name": account_name,
@@ -4570,6 +4882,8 @@ def attach_auto_snapshot(
         "metrics": metrics,
         "comments_complete": bool(comments.get("complete")),
         "loaded_comment_line_count": comments.get("text_line_count", 0),
+        "structured_comment_count": structured_comments.get("count", 0) if isinstance(structured_comments, dict) else 0,
+        "markdown_embedded": markdown_embedded,
     }
     if dry_run:
         return {
@@ -4590,7 +4904,11 @@ def attach_auto_snapshot(
             "missing": [key for key, value in metrics.items() if isinstance(value, dict) and value.get("source") == "missing"],
             "metrics": metrics,
             "loaded_comment_line_count": comments.get("text_line_count", 0),
+            "structured_comment_count": structured_comments.get("count", 0) if isinstance(structured_comments, dict) else 0,
+            "markdown_embedded": False,
         }
+    markdown_embedded = upsert_page_data_section(markdown_path, page_data)
+    latest["markdown_embedded"] = markdown_embedded
     write_json(snapshot_root / "latest.json", latest)
     history_row = {
         "snapshot_id": snapshot_id,
@@ -4617,6 +4935,7 @@ def attach_auto_snapshot(
         "match_method": match_method,
         "created_from_snapshot": created_from_snapshot,
         "missing": [key for key, value in metrics.items() if isinstance(value, dict) and value.get("source") == "missing"],
+        "markdown_embedded": markdown_embedded,
     }
     append_processed_snapshot(base, processed_row)
     return {
@@ -4624,6 +4943,8 @@ def attach_auto_snapshot(
         **processed_row,
         "metrics": metrics,
         "loaded_comment_line_count": comments.get("text_line_count", 0),
+        "structured_comment_count": structured_comments.get("count", 0) if isinstance(structured_comments, dict) else 0,
+        "markdown_embedded": markdown_embedded,
     }
 
 
