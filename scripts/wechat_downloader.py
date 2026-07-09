@@ -883,6 +883,10 @@ def auto_snapshot_index_path(base: Path) -> Path:
     return auto_snapshot_root(base) / "index.jsonl"
 
 
+def auto_snapshot_processed_path(base: Path) -> Path:
+    return auto_snapshot_root(base) / "processed.jsonl"
+
+
 def safe_context_status(marker: dict[str, Any]) -> dict[str, Any]:
     safe_keys = ["status", "ready", "ready_at", "adapter", "method", "article_count", "history_csv", "history_json"]
     return {key: marker[key] for key in safe_keys if key in marker}
@@ -4231,6 +4235,465 @@ def extract_auto_snapshot(base: Path, snapshot_id: str = "latest", output_dir: s
     }
 
 
+def load_processed_snapshots(base: Path) -> dict[str, dict[str, Any]]:
+    path = auto_snapshot_processed_path(base)
+    if not path.exists():
+        return {}
+    rows: dict[str, dict[str, Any]] = {}
+    with path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            snapshot_id = str(row.get("snapshot_id") or "")
+            if snapshot_id:
+                rows[snapshot_id] = row
+    return rows
+
+
+def append_processed_snapshot(base: Path, row: dict[str, Any]) -> None:
+    path = auto_snapshot_processed_path(base)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(scrub_payload(row), ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def wechat_url_identity(url: str) -> str:
+    try:
+        cleaned = clean_url(url)
+    except ValueError:
+        cleaned = safe_display_url(url)
+    parsed = urllib.parse.urlsplit(cleaned)
+    qs = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+    parts = []
+    for key in ["__biz", "mid", "idx", "sn"]:
+        value = (qs.get(key) or [""])[0]
+        if value:
+            parts.append(f"{key}={value}")
+    if parts:
+        return "&".join(parts)
+    if parsed.path.startswith("/s/"):
+        return parsed.path
+    return hashlib.sha256(cleaned.encode("utf-8")).hexdigest()[:16]
+
+
+def snapshot_metadata(base: Path, snapshot_id: str) -> dict[str, Any]:
+    row = get_auto_snapshot(base, snapshot_id)
+    run_dir = Path(str(row.get("run_dir") or "")).expanduser().resolve()
+    snapshot_root = auto_snapshot_root(base).expanduser().resolve()
+    expected_dir = snapshot_root / snapshot_id
+    if run_dir != expected_dir:
+        raise ValueError(f"snapshot run_dir does not match snapshot_id: {snapshot_id}")
+    try:
+        run_dir.relative_to(snapshot_root)
+    except ValueError as exc:
+        raise ValueError(f"snapshot run_dir is outside snapshot root: {run_dir}") from exc
+    ready_path = run_dir / "ready.json"
+    if not ready_path.exists():
+        raise FileNotFoundError(f"snapshot is not ready: {snapshot_id}")
+    ready = read_json(ready_path)
+    if not isinstance(ready, dict) or not ready.get("ready"):
+        raise ValueError(f"snapshot is not marked ready: {snapshot_id}")
+    snapshot_path = run_dir / "snapshot.json"
+    snapshot = read_json(snapshot_path) if snapshot_path.exists() else {}
+    raw_url = str(snapshot.get("url") or row.get("url") or "")
+    try:
+        url = clean_url(raw_url) if raw_url else ""
+    except ValueError:
+        url = safe_display_url(raw_url)
+    return {
+        "snapshot_id": snapshot_id,
+        "run_dir": str(run_dir),
+        "title": str(snapshot.get("title") or row.get("title") or "微信文章").strip(),
+        "account_name": str(snapshot.get("account_name") or row.get("account_name") or "").strip(),
+        "author": str(snapshot.get("author") or row.get("author") or "").strip(),
+        "publish_time": str(snapshot.get("publish_time") or row.get("publish_time") or "").strip(),
+        "captured_at": str(snapshot.get("captured_at") or row.get("captured_at") or "").strip(),
+        "url": url,
+        "url_identity": wechat_url_identity(url) if url else "",
+    }
+
+
+def snapshot_rows_with_status(base: Path) -> list[dict[str, Any]]:
+    processed = load_processed_snapshots(base)
+    rows = []
+    for row in load_auto_snapshots(base):
+        snapshot_id = str(row.get("snapshot_id") or "")
+        status = processed.get(snapshot_id)
+        item = dict(row)
+        item["processed"] = bool(status)
+        if status:
+            item["processed_status"] = status.get("status", "")
+            item["attached_at"] = status.get("attached_at", "")
+            item["article_dir"] = status.get("article_dir", "")
+            item["match_method"] = status.get("match_method", "")
+        rows.append(item)
+    return rows
+
+
+def list_snapshot_inbox(base: Path, limit: int, include_processed: bool = False) -> dict[str, Any]:
+    rows = snapshot_rows_with_status(base)
+    if not include_processed:
+        rows = [row for row in rows if not row.get("processed")]
+    shown = rows[: max(limit, 1)]
+    return {
+        "ok": True,
+        "mode": "proxy-enhancer",
+        "snapshot_root": str(auto_snapshot_root(base)),
+        "processed_index": str(auto_snapshot_processed_path(base)),
+        "total_count": len(rows),
+        "shown_count": len(shown),
+        "snapshots": shown,
+    }
+
+
+def read_index_rows(index_path: Path) -> list[dict[str, str]]:
+    if not index_path.exists():
+        return []
+    with index_path.open("r", encoding="utf-8", newline="") as fh:
+        return [dict(row) for row in csv.DictReader(fh)]
+
+
+def write_index_rows(index_path: Path, rows: list[dict[str, Any]]) -> None:
+    base_fields = [
+        "seq",
+        "article_id",
+        "title",
+        "account",
+        "publish_time",
+        "source_url",
+        "markdown_path",
+        "image_dir",
+        "image_count",
+        "read_count",
+        "like_count",
+        "status",
+        "error",
+        "downloaded_at",
+        "source_mode",
+        "snapshot_id",
+    ]
+    fields = list(base_fields)
+    for row in rows:
+        for key in row.keys():
+            if key not in fields:
+                fields.append(key)
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    with index_path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fields)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row.get(field, "") for field in fields})
+
+
+def find_existing_markdown_for_snapshot(output_root: Path, meta: dict[str, Any]) -> dict[str, Any] | None:
+    account_name = str(meta.get("account_name") or "")
+    candidate_dirs = []
+    if account_name:
+        candidate_dirs.append(output_root / safe_name(account_name, 90))
+    if output_root.exists():
+        candidate_dirs.extend(path for path in output_root.iterdir() if path.is_dir() and path not in candidate_dirs)
+    target_url = str(meta.get("url") or "")
+    target_identity = str(meta.get("url_identity") or "")
+    title = str(meta.get("title") or "")
+    publish_time = str(meta.get("publish_time") or "")
+    for account_dir in candidate_dirs:
+        index_path = account_dir / "index.csv"
+        rows = read_index_rows(index_path)
+        for row in rows:
+            source_url = str(row.get("source_url") or "")
+            markdown_rel = str(row.get("markdown_path") or "")
+            if not markdown_rel:
+                continue
+            source_identity = wechat_url_identity(source_url) if source_url else ""
+            exact_url = target_url and source_url and safe_display_url(source_url) == safe_display_url(target_url)
+            exact_identity = target_identity and source_identity and source_identity == target_identity
+            title_match = (
+                account_name
+                and title
+                and str(row.get("account") or "") == account_name
+                and str(row.get("title") or "") == title
+                and (not publish_time or publish_time == str(row.get("publish_time") or ""))
+            )
+            if exact_url or exact_identity or title_match:
+                markdown_path = account_dir / markdown_rel
+                if not markdown_path.exists():
+                    continue
+                return {
+                    "account_dir": account_dir,
+                    "index_path": index_path,
+                    "markdown_rel": markdown_rel,
+                    "markdown_path": markdown_path,
+                    "index_row": row,
+                    "match_method": "url" if exact_url else ("wechat_id" if exact_identity else "title"),
+                }
+    return None
+
+
+def next_index_seq(rows: list[dict[str, Any]]) -> str:
+    max_seq = 0
+    for row in rows:
+        try:
+            max_seq = max(max_seq, int(str(row.get("seq") or "0")))
+        except ValueError:
+            continue
+    return seq_name(max_seq + 1)
+
+
+def metrics_flat(metrics: dict[str, Any]) -> dict[str, Any]:
+    flat: dict[str, Any] = {}
+    for key, value in metrics.items():
+        if isinstance(value, dict):
+            flat[key] = value.get("value")
+        else:
+            flat[key] = value
+    return flat
+
+
+SNAPSHOT_ATTACH_FILES = [
+    "article.md",
+    "comments.json",
+    "metrics.json",
+    "style_profile.json",
+    "image_urls.json",
+    "engagement.html",
+    "report.md",
+]
+
+
+def copy_attached_snapshot_files(source_dir: Path, destination: Path) -> list[str]:
+    destination.mkdir(parents=True, exist_ok=True)
+    copied = []
+    for name in SNAPSHOT_ATTACH_FILES:
+        source = source_dir / name
+        if not source.exists() or not source.is_file():
+            continue
+        shutil.copy2(source, destination / name)
+        copied.append(name)
+    return copied
+
+
+def attach_auto_snapshot(
+    base: Path,
+    snapshot_id: str,
+    output_root: str = "",
+    force: bool = False,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    processed = load_processed_snapshots(base)
+    if snapshot_id in processed and not force:
+        return {
+            "ok": True,
+            "snapshot_id": snapshot_id,
+            "status": "skipped",
+            "reason": "already_processed",
+            **processed[snapshot_id],
+        }
+    meta = snapshot_metadata(base, snapshot_id)
+    extracted = extract_auto_snapshot(base, snapshot_id)
+    extracted_dir = Path(str(extracted["output_dir"]))
+    output_base = Path(output_root).expanduser().resolve() if output_root else DEFAULT_DELIVERY_DIR.expanduser().resolve()
+    account_name = str(meta.get("account_name") or "_unknown").strip() or "_unknown"
+    account_dir = account_delivery_dir(str(output_base), account_name)
+    existing = find_existing_markdown_for_snapshot(output_base, meta)
+    title = str(meta.get("title") or "微信文章")
+    article_key = str(meta.get("url_identity") or meta.get("url") or title)
+    article_hash = hashlib.sha256(article_key.encode("utf-8")).hexdigest()[:8]
+    created_from_snapshot = False
+
+    if existing:
+        account_dir = Path(existing["account_dir"])
+        markdown_path = Path(existing["markdown_path"])
+        markdown_rel = str(existing["markdown_rel"])
+        article_stem = markdown_path.stem
+        match_method = str(existing["match_method"])
+    else:
+        article_stem = safe_name(f"{title}--{article_hash}", 90)
+        markdown_rel = f"articles/{article_stem}.md"
+        markdown_path = account_dir / markdown_rel
+        if not dry_run:
+            account_dir.mkdir(parents=True, exist_ok=True)
+            (account_dir / "articles").mkdir(parents=True, exist_ok=True)
+            source_article_md = extracted_dir / "article.md"
+            if not markdown_path.exists():
+                shutil.copy2(source_article_md, markdown_path)
+            index_path = account_dir / "index.csv"
+            rows = read_index_rows(index_path)
+            rows.append(
+                {
+                    "seq": next_index_seq(rows),
+                    "article_id": article_hash,
+                    "title": title,
+                    "account": account_name if account_name != "_unknown" else "",
+                    "publish_time": meta.get("publish_time", ""),
+                    "source_url": meta.get("url", ""),
+                    "markdown_path": markdown_rel,
+                    "image_dir": "",
+                    "image_count": extracted.get("image_count", 0),
+                    "read_count": "",
+                    "like_count": "",
+                    "status": "snapshot",
+                    "error": "",
+                    "downloaded_at": utc_now(),
+                    "source_mode": "snapshot",
+                    "snapshot_id": snapshot_id,
+                }
+            )
+            write_index_rows(index_path, rows)
+        match_method = "created_from_snapshot"
+        created_from_snapshot = True
+
+    snapshot_root = account_dir / "snapshots" / article_stem
+    snapshot_target = snapshot_root / "snapshots" / snapshot_id
+    copied_files: list[str] = []
+    if not dry_run:
+        copied_files = copy_attached_snapshot_files(extracted_dir, snapshot_target)
+
+    metrics_path = extracted_dir / "metrics.json"
+    metrics = read_json(metrics_path) if metrics_path.exists() else {}
+    comments_path = extracted_dir / "comments.json"
+    comments = read_json(comments_path) if comments_path.exists() else {}
+    latest = {
+        "snapshot_id": snapshot_id,
+        "attached_at": utc_now(),
+        "captured_at": meta.get("captured_at", ""),
+        "title": title,
+        "account_name": account_name,
+        "url": meta.get("url", ""),
+        "markdown_path": str(markdown_path),
+        "snapshot_dir": str(snapshot_target),
+        "files": copied_files,
+        "metrics": metrics,
+        "comments_complete": bool(comments.get("complete")),
+        "loaded_comment_line_count": comments.get("text_line_count", 0),
+    }
+    if dry_run:
+        return {
+            "ok": True,
+            "snapshot_id": snapshot_id,
+            "status": "planned",
+            "url": meta.get("url", ""),
+            "url_identity": meta.get("url_identity", ""),
+            "account_name": account_name,
+            "title": title,
+            "captured_at": meta.get("captured_at", ""),
+            "article_dir": str(account_dir),
+            "markdown_path": str(markdown_path),
+            "snapshot_dir": str(snapshot_target),
+            "files": list(SNAPSHOT_ATTACH_FILES),
+            "match_method": match_method,
+            "created_from_snapshot": created_from_snapshot,
+            "missing": [key for key, value in metrics.items() if isinstance(value, dict) and value.get("source") == "missing"],
+            "metrics": metrics,
+            "loaded_comment_line_count": comments.get("text_line_count", 0),
+        }
+    write_json(snapshot_root / "latest.json", latest)
+    history_row = {
+        "snapshot_id": snapshot_id,
+        "captured_at": meta.get("captured_at", ""),
+        "attached_at": latest["attached_at"],
+        **metrics_flat(metrics),
+    }
+    with (snapshot_root / "metrics_history.jsonl").open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(history_row, ensure_ascii=False, sort_keys=True) + "\n")
+
+    processed_row = {
+        "snapshot_id": snapshot_id,
+        "url": meta.get("url", ""),
+        "url_identity": meta.get("url_identity", ""),
+        "account_name": account_name,
+        "title": title,
+        "captured_at": meta.get("captured_at", ""),
+        "attached_at": latest["attached_at"],
+        "status": "attached",
+        "article_dir": str(account_dir),
+        "markdown_path": str(markdown_path),
+        "snapshot_dir": str(snapshot_target),
+        "files": copied_files,
+        "match_method": match_method,
+        "created_from_snapshot": created_from_snapshot,
+        "missing": [key for key, value in metrics.items() if isinstance(value, dict) and value.get("source") == "missing"],
+    }
+    append_processed_snapshot(base, processed_row)
+    return {
+        "ok": True,
+        **processed_row,
+        "metrics": metrics,
+        "loaded_comment_line_count": comments.get("text_line_count", 0),
+    }
+
+
+def select_snapshots_for_attach(base: Path, args: argparse.Namespace) -> list[str]:
+    rows = snapshot_rows_with_status(base)
+    if args.all_unprocessed:
+        return [str(row.get("snapshot_id")) for row in rows if row.get("snapshot_id") and not row.get("processed")]
+    if args.since:
+        cutoff = parse_time(args.since)
+        if not cutoff:
+            raise ValueError(f"invalid --since datetime: {args.since}")
+        selected = []
+        for row in rows:
+            captured = parse_time(str(row.get("captured_at") or row.get("created_at") or ""))
+            if captured and captured.tzinfo and cutoff.tzinfo is None:
+                cutoff = cutoff.replace(tzinfo=captured.tzinfo)
+            if captured and captured >= cutoff and (args.include_processed or not row.get("processed")):
+                selected.append(str(row.get("snapshot_id")))
+        return selected
+    if args.snapshot_id == "latest":
+        return [snapshot_id_or_latest(base, "latest")]
+    return [args.snapshot_id]
+
+
+def attach_snapshots_for_args(base: Path, args: argparse.Namespace) -> dict[str, Any]:
+    snapshot_ids = select_snapshots_for_attach(base, args)
+    attached = []
+    failed = []
+    for snapshot_id in snapshot_ids:
+        try:
+            attached.append(attach_auto_snapshot(base, snapshot_id, args.output_dir, args.force, args.dry_run))
+        except Exception as exc:
+            failed.append({"snapshot_id": snapshot_id, "error": sanitize_text_urls(str(exc))})
+    created = [item for item in attached if item.get("created_from_snapshot")]
+    linked = [item for item in attached if item.get("status") in {"attached", "planned"} and not item.get("created_from_snapshot")]
+    skipped = [item for item in attached if item.get("status") == "skipped"]
+    return {
+        "ok": not failed,
+        "mode": "proxy-enhancer",
+        "dry_run": bool(args.dry_run),
+        "requested_count": len(snapshot_ids),
+        "attached_count": len([item for item in attached if item.get("status") == "attached"]),
+        "planned_count": len([item for item in attached if item.get("status") == "planned"]),
+        "linked_existing_count": len(linked),
+        "created_from_snapshot_count": len(created),
+        "skipped_count": len(skipped),
+        "failure_count": len(failed),
+        "output_root": str(Path(args.output_dir).expanduser().resolve() if args.output_dir else DEFAULT_DELIVERY_DIR.expanduser().resolve()),
+        "attached": attached,
+        "failed": failed,
+    }
+
+
+def command_snapshot_inbox(args: argparse.Namespace) -> int:
+    base = runtime_dir(args.runtime_dir)
+    result = list_snapshot_inbox(base, args.limit, args.include_processed)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def command_snapshot_attach(args: argparse.Namespace) -> int:
+    base = runtime_dir(args.runtime_dir)
+    try:
+        result = attach_snapshots_for_args(base, args)
+    except Exception as exc:
+        result = {"ok": False, "mode": "proxy-enhancer", "error": sanitize_text_urls(str(exc))}
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if result.get("ok") else 3
+
+
 def command_history_capture_prepare(args: argparse.Namespace) -> int:
     base = runtime_dir(args.runtime_dir)
     try:
@@ -4595,6 +5058,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=10)
     p.set_defaults(func=command_snapshot_list)
 
+    p = sub.add_parser("snapshot-inbox", help="List unprocessed proxy-enhancer snapshots")
+    p.add_argument("--runtime-dir", default=argparse.SUPPRESS, help="Override runtime directory")
+    p.add_argument("--limit", type=int, default=20)
+    p.add_argument("--include-processed", action="store_true", help="Include already attached snapshots")
+    p.set_defaults(func=command_snapshot_inbox)
+
     p = sub.add_parser("snapshot-latest", help="Show the latest snapshot captured by proxy-enhancer")
     p.add_argument("--runtime-dir", default=argparse.SUPPRESS, help="Override runtime directory")
     p.set_defaults(func=command_snapshot_latest)
@@ -4610,6 +5079,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("snapshot_id", nargs="?", default="latest", help="Snapshot id, or latest")
     p.add_argument("--output-dir", default="", help="Optional destination directory")
     p.set_defaults(func=command_snapshot_extract)
+
+    p = sub.add_parser("snapshot-attach", help="Attach proxy-enhancer snapshots into the article library")
+    p.add_argument("--runtime-dir", default=argparse.SUPPRESS, help="Override runtime directory")
+    p.add_argument("snapshot_id", nargs="?", default="latest", help="Snapshot id, or latest")
+    p.add_argument("--all-unprocessed", action="store_true", help="Attach all snapshots not yet processed")
+    p.add_argument("--since", default="", help="Attach snapshots captured since this ISO datetime")
+    p.add_argument("--include-processed", action="store_true", help="With --since, include already processed snapshots")
+    p.add_argument("--force", action="store_true", help="Re-attach snapshots even if already processed")
+    p.add_argument("--dry-run", action="store_true", help="Preview attach plan without writing article-library files or processed state")
+    p.add_argument("--output-dir", default="", help="Optional article library root")
+    p.set_defaults(func=command_snapshot_attach)
 
     p = sub.add_parser("adapter-watch", help="Wait for WeChat desktop context and fetch history rows when ready")
     p.add_argument("--runtime-dir", default=argparse.SUPPRESS, help="Override runtime directory")

@@ -234,6 +234,35 @@ python3 scripts/wechat_downloader.py snapshot-list --limit 10
 python3 scripts/wechat_downloader.py snapshot-export "<snapshot-id>"
 ```
 
+When the user says they have saved snapshots, treat proxy snapshots as an inbox rather than a single latest item:
+
+```bash
+python3 scripts/wechat_downloader.py snapshot-inbox --limit 50
+python3 scripts/wechat_downloader.py snapshot-attach --all-unprocessed
+```
+
+`snapshot-attach` writes structured snapshot data back into the article library:
+
+```text
+~/Downloads/wechat-articles/<account-name>/
+|-- articles/<safe-title>.md
+`-- snapshots/<article-key>/
+    |-- latest.json
+    |-- metrics_history.jsonl
+    `-- snapshots/<snapshot-id>/
+        |-- article.md
+        |-- comments.json
+        |-- metrics.json
+        |-- style_profile.json
+        |-- image_urls.json
+        |-- engagement.html
+        `-- report.md
+```
+
+If the article was not previously downloaded, `snapshot-attach` creates a Markdown article from the snapshot body and adds an `index.csv` row with `source_mode=snapshot`.
+
+Do not attach raw snapshot directories recursively. The attach step only copies structured extraction output into the user-facing article library.
+
 Stop the enhancer only when the user explicitly asks:
 
 ```bash

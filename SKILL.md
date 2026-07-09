@@ -157,6 +157,20 @@ python3 {baseDir}/scripts/wechat_downloader.py snapshot-latest
 python3 {baseDir}/scripts/wechat_downloader.py snapshot-list --limit 10
 ```
 
+如果用户说“已保存”“处理刚才保存的快照”“整理今天保存的快照”，默认不要只处理 latest。先看快照收件箱，再把所有未处理快照归档到文章库：
+
+```bash
+python3 {baseDir}/scripts/wechat_downloader.py snapshot-inbox --limit 50
+python3 {baseDir}/scripts/wechat_downloader.py snapshot-attach --all-unprocessed
+```
+
+归档规则：
+
+- 已下载过的文章：按 URL/微信文章参数匹配，增强数据放到对应公众号目录。
+- 没下载过的文章：从快照正文生成 Markdown，也放到 `~/Downloads/wechat-articles/<公众号名>/`。
+- 同一篇文章多次保存：保留每次快照，并更新 `latest.json` 和 `metrics_history.jsonl`。
+- 不递归复制原始快照目录；只归档结构化提取产物，避免把敏感或调试文件带进文章库。
+
 把最近快照提取成后续处理用的结构化文件：
 
 ```bash
