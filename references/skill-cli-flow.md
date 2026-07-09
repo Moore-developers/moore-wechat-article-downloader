@@ -94,23 +94,21 @@ Do not use `channels.weixin.qq.com/web/pages/mp_profile` as the primary path. It
 Tell the user:
 
 ```text
-我会启动本地代理。请确认 mitmproxy 证书已信任，并把 WeChat 流量路由到 127.0.0.1:8899。然后把复制的旧版 profile_ext 历史入口发到微信文件传输助手，用微信桌面客户端内置浏览器打开；看到文章历史列表后向下滚动。
+我会复用本地常驻代理 127.0.0.1:23344。请确认 mitmproxy 证书已信任；任务期间系统代理会临时路由到 23344，出口自动串到当前系统代理。然后把复制的旧版 profile_ext 历史入口发到微信文件传输助手，用微信桌面客户端内置浏览器打开；看到文章历史列表后向下滚动。
 ```
 
 Start proxy adapter:
 
 ```bash
-python3 scripts/wechat_downloader.py history-proxy-setup --port 8899
-python3 scripts/wechat_downloader.py history-proxy-setup --port 8899 --install --yes
-python3 scripts/wechat_downloader.py history-proxy-start "<session-id>" --port 8899 --limit 100
-python3 scripts/wechat_downloader.py history-proxy-start "<session-id>" --port 8899 --limit 100 --upstream-proxy auto
-python3 scripts/wechat_downloader.py history-proxy-enable --port 8899 --yes
+python3 scripts/wechat_downloader.py proxy-service-start --port 23344 --upstream-proxy auto
+python3 scripts/wechat_downloader.py proxy-service-status --port 23344
+python3 scripts/wechat_downloader.py history-capture-prepare "<sample-article-url>" --port 23344 --use-service --yes
 ```
 
 `history-proxy-start` uses `--upstream-proxy auto` by default. If the user's current macOS HTTP proxy is another local or remote proxy, mitmproxy chains outbound traffic through it:
 
 ```text
-WeChat/system proxy -> mitmproxy 127.0.0.1:8899 -> existing system proxy
+WeChat/system proxy -> mitmproxy 127.0.0.1:23344 -> existing system proxy
 ```
 
 Use `--upstream-proxy http://host:port` only for an explicit override. Use `--upstream-proxy none` only when direct outbound traffic is desired.
@@ -147,11 +145,11 @@ python3 scripts/wechat_downloader.py history-download-selected --session-id "<se
 
 Add `--output-dir "<dir>"` if the user wants a specific destination.
 
-Stop and restore proxy:
+Finish and restore system proxy. The local proxy service stays running by default:
 
 ```bash
-python3 scripts/wechat_downloader.py history-proxy-stop "<session-id>"
-python3 scripts/wechat_downloader.py history-proxy-disable --yes
+python3 scripts/wechat_downloader.py history-capture-finish "<session-id>" --yes
+python3 scripts/wechat_downloader.py proxy-service-stop --port 23344 --yes
 ```
 
 ## Selection Contract
@@ -173,11 +171,11 @@ Options can combine. Filtering order is:
 
 ## Adapter Boundary
 
-`history-proxy-start` starts a mitmproxy adapter that captures user-owned WeChat `profile_ext?action=getmsg` responses and materializes `history_articles.csv/json`.
+`proxy-service-start` starts or refreshes a persistent mitmproxy adapter on `127.0.0.1:23344`. The service only MITMs WeChat article domains; non-WeChat traffic is passed through to the upstream proxy without being recorded.
 
 It must not write or print raw cookies, tokens, pass tickets, keys, or auth headers. It writes only article rows and a safe ready marker.
 
-`history-proxy-enable` and `history-proxy-disable` modify macOS HTTP/HTTPS proxy settings only with `--yes`. The runtime saves previous proxy settings under the local runtime directory before enabling the proxy so it can restore them.
+`history-capture-prepare` modifies macOS HTTP/HTTPS proxy settings only with `--yes`. The runtime saves previous proxy settings under the local runtime directory before enabling the proxy so `history-capture-finish --yes` can restore them.
 
 `history-proxy-setup --install --yes` installs mitmproxy with Homebrew when `mitmdump` is missing. Without `--yes`, setup only reports the install command and does not modify the machine.
 

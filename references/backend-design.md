@@ -144,13 +144,13 @@ Account history mode:
 python3 scripts/wechat_downloader.py history-start "<sample-article-url>"
 python3 scripts/wechat_downloader.py history-open "<session-id>"
 python3 scripts/wechat_downloader.py history-status "<session-id>"
-python3 scripts/wechat_downloader.py history-proxy-setup --port 8899
-python3 scripts/wechat_downloader.py history-proxy-setup --port 8899 --install --yes
-python3 scripts/wechat_downloader.py history-proxy-start "<session-id>" --port 8899 --limit 100
-python3 scripts/wechat_downloader.py history-proxy-enable --port 8899 --yes
+python3 scripts/wechat_downloader.py history-proxy-setup --port 23344
+python3 scripts/wechat_downloader.py history-proxy-setup --port 23344 --install --yes
+python3 scripts/wechat_downloader.py proxy-service-start --port 23344 --upstream-proxy auto
+python3 scripts/wechat_downloader.py history-capture-prepare "<sample-article-url>" --port 23344 --use-service --yes
 python3 scripts/wechat_downloader.py adapter-watch "<session-id>" --timeout 120
-python3 scripts/wechat_downloader.py history-proxy-stop "<session-id>"
-python3 scripts/wechat_downloader.py history-proxy-disable --yes
+python3 scripts/wechat_downloader.py history-capture-finish "<session-id>" --yes
+python3 scripts/wechat_downloader.py proxy-service-stop --port 23344 --yes
 python3 scripts/wechat_downloader.py history-fetch "<session-id>" --limit 50
 python3 scripts/wechat_downloader.py history-preview --session-id "<session-id>"
 python3 scripts/wechat_downloader.py history-select --session-id "<session-id>" --latest 20

@@ -195,14 +195,14 @@ python3 scripts/wechat_downloader.py proxy-snapshot-verify "<article-url>"
 ## 手动验证流程
 
 1. Skill 启动验证会话。
-2. Skill 明确询问是否临时启用 `127.0.0.1:8899`。
-3. 用户确认后，Skill 启动 mitmproxy 并链到当前系统代理。
+2. Skill 明确询问是否临时启用 `127.0.0.1:23344`。
+3. 用户确认后，Skill 复用常驻 mitmproxy，并链到当前系统代理。
 4. Skill 给出文章 URL 或旧版入口。
 5. 用户在微信内置浏览器打开文章。
 6. 页面加载完成后，用户点击 `保存当前页面`。
 7. 用户回复已完成。
 8. Skill 导出验证包。
-9. Skill 恢复系统代理并停止 `8899`。
+9. Skill 恢复系统代理；默认不停止常驻 `23344`。
 10. Skill 输出 `report.md` 摘要。
 
 ## 当前执行顺序

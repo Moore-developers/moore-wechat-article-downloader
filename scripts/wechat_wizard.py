@@ -29,6 +29,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 from wechat_downloader import (  # noqa: E402
     DEFAULT_DELIVERY_DIR,
+    DEFAULT_PROXY_PORT,
     build_history_open_url,
     choose_network_service,
     extract_urls,
@@ -831,7 +832,7 @@ def gate_environment(base: Path, task_id: str, output_dir: Path) -> dict[str, An
 
 
 def mitmdump_install_command() -> str:
-    return f"python3 {SCRIPT_DIR / 'wechat_downloader.py'} history-proxy-setup --port 8899 --install --yes"
+    return f"python3 {SCRIPT_DIR / 'wechat_downloader.py'} history-proxy-setup --port {DEFAULT_PROXY_PORT} --install --yes"
 
 
 def gate_history_environment(base: Path, task_id: str) -> dict[str, Any]:
@@ -1789,7 +1790,7 @@ def run_history_mode(base: Path, task_id: str, intent: dict[str, Any], dry_run: 
                 "session_id": open_result["session_id"],
                 "mitmdump_available": bool(history_env_gate["evidence"].get("mitmdump_available")),
                 "mitmdump_path": str(history_env_gate["evidence"].get("mitmdump_path") or ""),
-                "proxy_port": 8899,
+                "proxy_port": DEFAULT_PROXY_PORT,
                 "open_url_type": open_result.get("open_url_type", ""),
             },
         )
@@ -2315,7 +2316,7 @@ def saved_proxy_state_matches(saved: dict[str, Any], service: str, endpoint: str
     return saved_service == service and normalize_proxy_endpoint(f"{host}:{port}") == normalize_proxy_endpoint(endpoint)
 
 
-def check_system_proxy_recoverability(base: Path, port: int = 8899) -> dict[str, Any]:
+def check_system_proxy_recoverability(base: Path, port: int = DEFAULT_PROXY_PORT) -> dict[str, Any]:
     state_path = system_proxy_state_path(base)
     saved_state_exists = state_path.exists()
     saved_state = load_system_proxy_restore_state(state_path)

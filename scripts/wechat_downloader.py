@@ -39,6 +39,7 @@ from typing import Any
 
 APP_DIR = Path.home() / ".moore" / "wechat-article-downloader"
 DEFAULT_DELIVERY_DIR = Path.home() / "Downloads" / "wechat-articles"
+DEFAULT_PROXY_PORT = 23344
 ARTICLE_URL_RE = re.compile(r"https?://mp\.weixin\.qq\.com/[^\s\"'<>]+", re.I)
 IMG_RE = re.compile(r"<img\b[^>]*>", re.I)
 ATTR_RE = re.compile(r"""([:\w-]+)\s*=\s*(['"])(.*?)\2""", re.S)
@@ -79,6 +80,11 @@ WECHAT_HISTORY_USER_AGENT = (
     "MicroMessenger/8.0.49 NetType/WIFI Language/zh_CN"
 )
 WECHAT_RADIUM_DIR = Path.home() / "Library" / "Containers" / "com.tencent.xinWeChat" / "Data" / "Documents" / "app_data" / "radium"
+WECHAT_MITM_HOST_RE = (
+    r"^(?!(?:.*\.)?"
+    r"(?:mp\.weixin\.qq\.com|res\.wx\.qq\.com|mmbiz\.qpic\.cn|support\.weixin\.qq\.com)"
+    r"(?::\d+)?$).*$"
+)
 
 
 
@@ -855,6 +861,10 @@ def session_proxy_log_path(base: Path, session_id: str) -> Path:
 
 def active_proxy_session_path(base: Path) -> Path:
     return base / "context" / "active-proxy-session.json"
+
+
+def proxy_service_state_path(base: Path) -> Path:
+    return base / "context" / "proxy-service.json"
 
 
 def system_proxy_state_path(base: Path) -> Path:
@@ -1687,7 +1697,35 @@ def normalize_upstream_proxy(value: str) -> str:
     return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
 
 
-def auto_upstream_proxy(port: int) -> str:
+def upstream_from_saved_proxy_state(base: Path | None, port: int) -> str:
+    if not base:
+        return ""
+    path = system_proxy_state_path(base)
+    if not path.exists():
+        return ""
+    try:
+        saved = read_json(path)
+    except Exception:
+        return ""
+    previous = saved.get("previous") if isinstance(saved.get("previous"), dict) else {}
+    for key in ("web", "secure_web"):
+        proxy = previous.get(key) if isinstance(previous.get(key), dict) else {}
+        if not proxy.get("enabled_bool"):
+            continue
+        server = str(proxy.get("server") or "").strip()
+        proxy_port = str(proxy.get("port") or "").strip()
+        if not server or not proxy_port or proxy_port == "0":
+            continue
+        if server in {"127.0.0.1", "localhost"} and proxy_port == str(port):
+            continue
+        try:
+            return normalize_upstream_proxy(f"http://{server}:{proxy_port}")
+        except ValueError:
+            continue
+    return ""
+
+
+def auto_upstream_proxy(port: int, base: Path | None = None) -> str:
     if sys.platform != "darwin":
         return ""
     try:
@@ -1703,14 +1741,14 @@ def auto_upstream_proxy(port: int) -> str:
     if not server or not proxy_port or proxy_port == "0":
         return ""
     if server in {"127.0.0.1", "localhost"} and proxy_port == str(port):
-        return ""
+        return upstream_from_saved_proxy_state(base, port)
     return normalize_upstream_proxy(f"http://{server}:{proxy_port}")
 
 
-def resolve_upstream_proxy(value: str, port: int) -> str:
+def resolve_upstream_proxy(value: str, port: int, base: Path | None = None) -> str:
     value = str(value or "").strip()
     if value.lower() == "auto":
-        return auto_upstream_proxy(port)
+        return auto_upstream_proxy(port, base)
     return normalize_upstream_proxy(value)
 
 
@@ -1757,9 +1795,54 @@ def running_history_proxy_on_port(base: Path, port: int) -> tuple[dict[str, Any]
     return None, None
 
 
+def stop_proxy_process(pid: int, port: int) -> bool:
+    if not history_proxy_process_running(pid, port):
+        return False
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except Exception:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except Exception:
+            pass
+    deadline = time.time() + 5
+    while time.time() < deadline and history_proxy_process_running(pid, port):
+        time.sleep(0.2)
+    if history_proxy_process_running(pid, port):
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except Exception:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except Exception:
+                pass
+    return True
+
+
+def write_proxy_service_state(base: Path, state: dict[str, Any]) -> None:
+    payload = {
+        "status": state.get("status", "running"),
+        "pid": state.get("pid", 0),
+        "port": state.get("port", DEFAULT_PROXY_PORT),
+        "proxy": state.get("proxy", f"127.0.0.1:{state.get('port', DEFAULT_PROXY_PORT)}"),
+        "upstream_proxy": state.get("upstream_proxy", ""),
+        "mitmdump": state.get("mitmdump", ""),
+        "addon": state.get("addon", ""),
+        "mitm_scope": state.get("mitm_scope", "wechat-only"),
+        "started_at": state.get("started_at", ""),
+        "updated_at": utc_now(),
+        "active_session_id": read_active_proxy_session(base).get("session_id", ""),
+    }
+    write_json(proxy_service_state_path(base), payload)
+
+
 def start_history_proxy(base: Path, session: dict[str, Any], port: int, limit: int, upstream_proxy: str = "auto") -> dict[str, Any]:
     ensure_runtime(base)
     state_path = session_proxy_state_path(base, session["session_id"])
+    try:
+        upstream = resolve_upstream_proxy(upstream_proxy, port, base)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
     if state_path.exists():
         state = read_json(state_path)
         try:
@@ -1768,19 +1851,32 @@ def start_history_proxy(base: Path, session: dict[str, Any], port: int, limit: i
             pid = 0
         state_port = int(state.get("port", port) or port)
         if history_proxy_process_running(pid, state_port):
-            write_active_proxy_session(base, session, int(state.get("port", port)), pid, str(state.get("upstream_proxy", "")), state_path)
-            return {
-                "ok": True,
-                "already_running": True,
-                "session_id": session["session_id"],
-                "pid": pid,
-                "port": state.get("port", port),
-                "proxy": f"127.0.0.1:{state.get('port', port)}",
-                "upstream_proxy": state.get("upstream_proxy", ""),
-                "state": str(state_path),
-                "log": state.get("log", str(session_proxy_log_path(base, session["session_id"]))),
-                "next_step": "Set HTTP/HTTPS proxy to 127.0.0.1 on this port, trust the mitmproxy certificate, then open the generated WeChat history link.",
-            }
+            if str(state.get("upstream_proxy") or "") != upstream:
+                if system_proxy_points_to_port("", "127.0.0.1", state_port):
+                    return {
+                        "ok": False,
+                        "error": "proxy upstream changed while system proxy points to the local proxy",
+                        "requires_proxy_restore": True,
+                        "current_upstream_proxy": state.get("upstream_proxy", ""),
+                        "desired_upstream_proxy": upstream,
+                        "next_step": "Restore system proxy first, then restart the local proxy service.",
+                    }
+                stop_proxy_process(pid, state_port)
+            else:
+                write_active_proxy_session(base, session, int(state.get("port", port)), pid, str(state.get("upstream_proxy", "")), state_path)
+                write_proxy_service_state(base, state)
+                return {
+                    "ok": True,
+                    "already_running": True,
+                    "session_id": session["session_id"],
+                    "pid": pid,
+                    "port": state.get("port", port),
+                    "proxy": f"127.0.0.1:{state.get('port', port)}",
+                    "upstream_proxy": state.get("upstream_proxy", ""),
+                    "state": str(state_path),
+                    "log": state.get("log", str(session_proxy_log_path(base, session["session_id"]))),
+                    "next_step": "Set HTTP/HTTPS proxy to 127.0.0.1 on this port, trust the mitmproxy certificate, then open the generated WeChat history link.",
+                }
 
     running_state, running_state_path = running_history_proxy_on_port(base, port)
     if running_state and running_state_path:
@@ -1788,27 +1884,40 @@ def start_history_proxy(base: Path, session: dict[str, Any], port: int, limit: i
             pid = int(running_state.get("pid") or 0)
         except (TypeError, ValueError):
             pid = 0
-        state = {
-            **running_state,
-            "ok": True,
-            "status": "running",
-            "session_id": session["session_id"],
-            "switched_from_session_id": running_state.get("session_id", ""),
-            "active_session_switched": True,
-            "state": str(state_path),
-            "updated_at": utc_now(),
-        }
-        write_json(state_path, state)
-        write_active_proxy_session(base, session, port, pid, str(running_state.get("upstream_proxy", "")), state_path)
-        return {
-            **state,
-            "pid": pid,
-            "port": port,
-            "proxy": f"127.0.0.1:{port}",
-            "log": running_state.get("log", str(session_proxy_log_path(base, str(running_state.get("session_id") or session["session_id"])))),
-            "reused_existing_proxy": True,
-            "next_step": "The existing 127.0.0.1 proxy process was reused and pointed at this session. Keep the system proxy unchanged and scroll the WeChat history page.",
-        }
+        if str(running_state.get("upstream_proxy") or "") != upstream:
+            if system_proxy_points_to_port("", "127.0.0.1", port):
+                return {
+                    "ok": False,
+                    "error": "proxy upstream changed while system proxy points to the local proxy",
+                    "requires_proxy_restore": True,
+                    "current_upstream_proxy": running_state.get("upstream_proxy", ""),
+                    "desired_upstream_proxy": upstream,
+                    "next_step": "Restore system proxy first, then restart the local proxy service.",
+                }
+            stop_proxy_process(pid, port)
+        else:
+            state = {
+                **running_state,
+                "ok": True,
+                "status": "running",
+                "session_id": session["session_id"],
+                "switched_from_session_id": running_state.get("session_id", ""),
+                "active_session_switched": True,
+                "state": str(state_path),
+                "updated_at": utc_now(),
+            }
+            write_json(state_path, state)
+            write_active_proxy_session(base, session, port, pid, str(running_state.get("upstream_proxy", "")), state_path)
+            write_proxy_service_state(base, state)
+            return {
+                **state,
+                "pid": pid,
+                "port": port,
+                "proxy": f"127.0.0.1:{port}",
+                "log": running_state.get("log", str(session_proxy_log_path(base, str(running_state.get("session_id") or session["session_id"])))),
+                "reused_existing_proxy": True,
+                "next_step": "The existing local proxy process was reused and pointed at this session. Keep the system proxy unchanged and scroll the WeChat history page.",
+            }
 
     mitmdump = shutil.which("mitmdump")
     if not mitmdump:
@@ -1821,11 +1930,6 @@ def start_history_proxy(base: Path, session: dict[str, Any], port: int, limit: i
     addon = mitm_addon_path()
     if not addon.exists():
         return {"ok": False, "error": f"missing mitm addon: {addon}"}
-    try:
-        upstream = resolve_upstream_proxy(upstream_proxy, port)
-    except ValueError as exc:
-        return {"ok": False, "error": str(exc)}
-
     log_path = session_proxy_log_path(base, session["session_id"])
     env = os.environ.copy()
     env.update(
@@ -1844,6 +1948,8 @@ def start_history_proxy(base: Path, session: dict[str, Any], port: int, limit: i
         str(port),
         "--set",
         "block_global=false",
+        "--ignore-hosts",
+        WECHAT_MITM_HOST_RE,
     ]
     if upstream:
         cmd.extend(["--mode", f"upstream:{upstream}"])
@@ -1863,9 +1969,11 @@ def start_history_proxy(base: Path, session: dict[str, Any], port: int, limit: i
         "log": str(log_path),
         "mitmdump": mitmdump,
         "addon": str(addon),
+        "mitm_scope": "wechat-only",
     }
     write_json(state_path, state)
     write_active_proxy_session(base, session, port, proc.pid, upstream, state_path)
+    write_proxy_service_state(base, state)
     return {
         **state,
         "state": str(state_path),
@@ -2007,6 +2115,99 @@ def stop_history_proxy(base: Path, session_id: str) -> dict[str, Any]:
         "state": str(state_path),
         "next_step": "Turn off the HTTP/HTTPS proxy in system or network settings if you enabled it manually.",
     }
+
+
+def service_session(base: Path, port: int) -> dict[str, Any]:
+    return {
+        "session_id": "proxy-service",
+        "account_id": "",
+        "account_name": "",
+        "sample_url": "",
+        "history_csv": str(base / "account-history" / "proxy-service" / "history_articles.csv"),
+        "history_json": str(base / "account-history" / "proxy-service" / "history_articles.json"),
+        "port": port,
+    }
+
+
+def start_proxy_service(base: Path, port: int = DEFAULT_PROXY_PORT, upstream_proxy: str = "auto") -> dict[str, Any]:
+    ensure_runtime(base)
+    setup = proxy_setup_status(port)
+    if not setup.get("ok"):
+        return {
+            "ok": False,
+            "stage": "setup",
+            "setup": setup,
+            "next_step": setup.get("next_step", "Install mitmproxy, then retry proxy-service-start."),
+        }
+    session = service_session(base, port)
+    result = start_history_proxy(base, session, port, 1, upstream_proxy)
+    if result.get("ok"):
+        write_proxy_service_state(base, result)
+    return result
+
+
+def status_proxy_service(base: Path, port: int = DEFAULT_PROXY_PORT) -> dict[str, Any]:
+    ensure_runtime(base)
+    state_path = proxy_service_state_path(base)
+    saved = read_json(state_path) if state_path.exists() else {}
+    running_state, running_state_path = running_history_proxy_on_port(base, port)
+    active = read_active_proxy_session(base)
+    running = False
+    pid = 0
+    if running_state:
+        try:
+            pid = int(running_state.get("pid") or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        running = history_proxy_process_running(pid, port)
+    return {
+        "ok": True,
+        "running": running,
+        "pid": pid,
+        "port": port,
+        "proxy": f"127.0.0.1:{port}",
+        "upstream_proxy": (running_state or saved).get("upstream_proxy", ""),
+        "state": str(state_path),
+        "running_state": str(running_state_path) if running_state_path else "",
+        "active_session_id": active.get("session_id", ""),
+        "mitm_scope": (running_state or saved).get("mitm_scope", "wechat-only"),
+        "system_proxy_points_here": system_proxy_points_to_port("", "127.0.0.1", port),
+    }
+
+
+def stop_proxy_service(base: Path, port: int = DEFAULT_PROXY_PORT, yes: bool = False) -> dict[str, Any]:
+    ensure_runtime(base)
+    if not yes:
+        return {
+            "ok": False,
+            "requires_confirmation": True,
+            "proxy": f"127.0.0.1:{port}",
+            "next_step": "Rerun with --yes to stop the local proxy service.",
+        }
+    if system_proxy_points_to_port("", "127.0.0.1", port):
+        return {
+            "ok": False,
+            "requires_proxy_restore": True,
+            "proxy": f"127.0.0.1:{port}",
+            "next_step": "Restore system proxy before stopping the local proxy service.",
+        }
+    running_state, running_state_path = running_history_proxy_on_port(base, port)
+    if not running_state:
+        state_path = proxy_service_state_path(base)
+        if state_path.exists():
+            saved = read_json(state_path)
+            saved["status"] = "stopped"
+            saved["stopped_at"] = utc_now()
+            write_json(state_path, saved)
+        return {"ok": True, "stopped": False, "message": "proxy service is not running", "port": port}
+    pid = int(running_state.get("pid") or 0)
+    stopped = stop_proxy_process(pid, port)
+    running_state["status"] = "stopped"
+    running_state["stopped_at"] = utc_now()
+    if running_state_path:
+        write_json(running_state_path, running_state)
+    write_proxy_service_state(base, running_state)
+    return {"ok": True, "stopped": stopped, "pid": pid, "port": port, "state": str(proxy_service_state_path(base))}
 
 
 def run_networksetup(args: list[str]) -> subprocess.CompletedProcess[str]:
@@ -2934,6 +3135,27 @@ def command_history_proxy_stop(args: argparse.Namespace) -> int:
     return 0 if result.get("ok") else 3
 
 
+def command_proxy_service_start(args: argparse.Namespace) -> int:
+    base = runtime_dir(args.runtime_dir)
+    result = start_proxy_service(base, args.port, args.upstream_proxy)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if result.get("ok") else 4
+
+
+def command_proxy_service_status(args: argparse.Namespace) -> int:
+    base = runtime_dir(args.runtime_dir)
+    result = status_proxy_service(base, args.port)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if result.get("ok") else 1
+
+
+def command_proxy_service_stop(args: argparse.Namespace) -> int:
+    base = runtime_dir(args.runtime_dir)
+    result = stop_proxy_service(base, args.port, args.yes)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if result.get("ok") else 3
+
+
 def prepare_history_capture(
     base: Path,
     sample_url: str,
@@ -2948,7 +3170,7 @@ def prepare_history_capture(
             "ok": False,
             "requires_confirmation": True,
             "command": "history-capture-prepare <sample-article-url> --yes",
-            "next_step": "Rerun with --yes to start the local capture proxy and temporarily route HTTP/HTTPS traffic through 127.0.0.1.",
+            "next_step": f"Rerun with --yes to start the local capture proxy and temporarily route HTTP/HTTPS traffic through 127.0.0.1:{port}.",
         }
     setup = proxy_setup_status(port)
     if not setup.get("ok"):
@@ -3006,7 +3228,7 @@ def prepare_history_capture(
     }
 
 
-def finish_history_capture(base: Path, session_id: str, limit: int, yes: bool) -> dict[str, Any]:
+def finish_history_capture(base: Path, session_id: str, limit: int, yes: bool, stop_proxy: bool = False) -> dict[str, Any]:
     if not yes:
         return {
             "ok": False,
@@ -3026,15 +3248,16 @@ def finish_history_capture(base: Path, session_id: str, limit: int, yes: bool) -
         status = {"session_id": session_id, "error": str(exc), "context_ready": False}
 
     restore: dict[str, Any]
-    stop: dict[str, Any]
+    stop: dict[str, Any] = {"ok": True, "stopped": False, "kept_running": True}
     try:
         restore = disable_system_proxy(base, yes=True)
     except Exception as exc:
         restore = {"ok": False, "error": str(exc)}
-    try:
-        stop = stop_history_proxy(base, session_id)
-    except Exception as exc:
-        stop = {"ok": False, "error": str(exc), "session_id": session_id}
+    if stop_proxy:
+        try:
+            stop = stop_history_proxy(base, session_id)
+        except Exception as exc:
+            stop = {"ok": False, "error": str(exc), "session_id": session_id}
 
     return {
         "ok": bool(preview.get("ok")) and bool(restore.get("ok")) and bool(stop.get("ok")),
@@ -3052,6 +3275,12 @@ def finish_history_capture(base: Path, session_id: str, limit: int, yes: bool) -
             "service": restore.get("service", ""),
             "restored": restore.get("restored", False),
             "error": restore.get("error", ""),
+        },
+        "proxy": {
+            "ok": bool(stop.get("ok")),
+            "stopped": bool(stop.get("stopped")),
+            "kept_running": bool(stop.get("kept_running")),
+            "error": stop.get("error", ""),
         },
         "stop": {
             "ok": bool(stop.get("ok")),
@@ -3079,7 +3308,7 @@ def command_history_capture_prepare(args: argparse.Namespace) -> int:
 
 def command_history_capture_finish(args: argparse.Namespace) -> int:
     base = runtime_dir(args.runtime_dir)
-    result = finish_history_capture(base, args.session_id, args.limit, args.yes)
+    result = finish_history_capture(base, args.session_id, args.limit, args.yes, args.stop_proxy)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if result.get("ok") else 3
 
@@ -3289,7 +3518,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("history-capture-prepare", help="Prepare one guided WeChat history capture session")
     p.add_argument("--runtime-dir", default=argparse.SUPPRESS, help="Override runtime directory")
     p.add_argument("sample_url")
-    p.add_argument("--port", type=int, default=8899)
+    p.add_argument("--port", type=int, default=DEFAULT_PROXY_PORT)
     p.add_argument("--limit", type=int, default=100)
     p.add_argument(
         "--upstream-proxy",
@@ -3298,13 +3527,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--yes", action="store_true", help="Actually start the proxy and modify macOS proxy settings")
     p.add_argument("--no-copy", action="store_true", help="Print the old history URL without copying it to clipboard")
+    p.add_argument("--use-service", action="store_true", help="Use the persistent local proxy service")
     p.set_defaults(func=command_history_capture_prepare)
 
     p = sub.add_parser("history-capture-finish", help="Finish guided WeChat history capture and restore proxy")
     p.add_argument("--runtime-dir", default=argparse.SUPPRESS, help="Override runtime directory")
     p.add_argument("session_id")
     p.add_argument("--limit", type=int, default=50)
-    p.add_argument("--yes", action="store_true", help="Actually restore macOS proxy settings and stop the local proxy")
+    p.add_argument("--yes", action="store_true", help="Actually restore macOS proxy settings")
+    p.add_argument("--stop-proxy", action="store_true", help="Also stop the local proxy process")
     p.set_defaults(func=command_history_capture_finish)
 
     p = sub.add_parser("adapter-watch", help="Wait for WeChat desktop context and fetch history rows when ready")
@@ -3323,7 +3554,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("history-proxy-start", help="Start mitmproxy adapter for WeChat history requests")
     p.add_argument("--runtime-dir", default=argparse.SUPPRESS, help="Override runtime directory")
     p.add_argument("session_id")
-    p.add_argument("--port", type=int, default=8899)
+    p.add_argument("--port", type=int, default=DEFAULT_PROXY_PORT)
     p.add_argument("--limit", type=int, default=100)
     p.add_argument(
         "--upstream-proxy",
@@ -3334,7 +3565,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("history-proxy-setup", help="Check mitmproxy and certificate setup")
     p.add_argument("--runtime-dir", default=argparse.SUPPRESS, help="Override runtime directory")
-    p.add_argument("--port", type=int, default=8899)
+    p.add_argument("--port", type=int, default=DEFAULT_PROXY_PORT)
     p.add_argument("--install", action="store_true", help="Install mitmproxy with Homebrew if mitmdump is missing")
     p.add_argument("--yes", action="store_true", help="Actually run brew install mitmproxy when --install is set")
     p.add_argument("--open-cert-page", action="store_true", help="Open http://mitm.it in the default browser")
@@ -3344,7 +3575,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--runtime-dir", default=argparse.SUPPRESS, help="Override runtime directory")
     p.add_argument("--service", default="", help="macOS network service, defaults to Wi-Fi when available")
     p.add_argument("--host", default="127.0.0.1")
-    p.add_argument("--port", type=int, default=8899)
+    p.add_argument("--port", type=int, default=DEFAULT_PROXY_PORT)
     p.add_argument("--yes", action="store_true", help="Actually modify network proxy settings")
     p.set_defaults(func=command_history_proxy_enable)
 
@@ -3363,6 +3594,27 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--runtime-dir", default=argparse.SUPPRESS, help="Override runtime directory")
     p.add_argument("session_id")
     p.set_defaults(func=command_history_proxy_stop)
+
+    p = sub.add_parser("proxy-service-start", help="Start or refresh persistent local mitmproxy service")
+    p.add_argument("--runtime-dir", default=argparse.SUPPRESS, help="Override runtime directory")
+    p.add_argument("--port", type=int, default=DEFAULT_PROXY_PORT)
+    p.add_argument(
+        "--upstream-proxy",
+        default="auto",
+        help="Upstream HTTP proxy. Use auto to chain the current macOS HTTP proxy.",
+    )
+    p.set_defaults(func=command_proxy_service_start)
+
+    p = sub.add_parser("proxy-service-status", help="Check persistent local proxy service")
+    p.add_argument("--runtime-dir", default=argparse.SUPPRESS, help="Override runtime directory")
+    p.add_argument("--port", type=int, default=DEFAULT_PROXY_PORT)
+    p.set_defaults(func=command_proxy_service_status)
+
+    p = sub.add_parser("proxy-service-stop", help="Stop persistent local proxy service")
+    p.add_argument("--runtime-dir", default=argparse.SUPPRESS, help="Override runtime directory")
+    p.add_argument("--port", type=int, default=DEFAULT_PROXY_PORT)
+    p.add_argument("--yes", action="store_true", help="Actually stop the local proxy service")
+    p.set_defaults(func=command_proxy_service_stop)
 
     p = sub.add_parser("history-import-context", help="Fetch history rows from a WeChat built-in-browser context URL")
     p.add_argument("--runtime-dir", default=argparse.SUPPRESS, help="Override runtime directory")

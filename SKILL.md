@@ -86,8 +86,8 @@ python3 {baseDir}/scripts/wechat_wizard.py run "代理历史：<sample-article-u
 **硬性规则**：
 - 必须使用旧版历史入口：`https://mp.weixin.qq.com/mp/profile_ext?action=home&__biz=<biz>&scene=124#wechat_redirect`
 - 不要引导用户使用 `channels.weixin.qq.com/web/pages/mp_profile`（视频号壳页，不触发 getmsg 接口）
-- 启用系统代理前必须向用户确认；结束时必须用 `history-capture-finish` 恢复代理
-- 切换公众号时不要停止 8899 端口，直接运行新的 `history-capture-prepare` 复用进程
+- 启用系统代理前必须向用户确认；结束时必须用 `history-capture-finish` 恢复系统代理
+- 默认使用常驻本地代理 `127.0.0.1:23344`；切换公众号时不要停止代理服务，直接运行新的 `history-capture-prepare` 复用进程
 
 告诉用户：把旧版入口发到微信文件传输助手，用桌面客户端内置浏览器打开，看到历史列表后向下滚动。
 
