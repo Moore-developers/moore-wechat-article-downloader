@@ -17,6 +17,9 @@ import html
 import json
 import os
 import re
+import subprocess
+import sys
+import time
 import urllib.parse
 from pathlib import Path
 from typing import Any
@@ -963,6 +966,7 @@ class WeChatHistoryCapture:
         self.fallback_session_id = session_id
         self.active_session_path = self.base / "context" / "active-proxy-session.json"
         self.credential_broker: WeChatCredentialBroker | None = None
+        self.last_resume_at: dict[str, float] = {}
 
     def active_session_id(self) -> str:
         if self.active_session_path.exists():
@@ -1068,8 +1072,23 @@ class WeChatHistoryCapture:
         ):
             return
         broker = self.ensure_credential_broker(context)
-        if broker:
-            broker.capture(request.url, request.headers, flow.response.headers if flow.response else None)
+        if not broker or not broker.capture(request.url, request.headers, flow.response.headers if flow.response else None):
+            return
+        biz = str((urllib.parse.parse_qs(urllib.parse.urlsplit(request.url).query).get("__biz") or [""])[0])
+        status = broker.status(biz).get("credentials", [])
+        if not status or status[0].get("status") != "valid":
+            return
+        now = time.monotonic()
+        if now - self.last_resume_at.get(biz, 0) < 10:
+            return
+        self.last_resume_at[biz] = now
+        exporter = Path(__file__).with_name("wechat_exporter.py")
+        subprocess.Popen(
+            [sys.executable, str(exporter), "--runtime-dir", str(self.base), "wechat-collection-resume-engagement", "--biz", biz],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
 
     def observe(self, flow: Any, markers: list[str], rows_count: int = 0, observe_path: Path | None = None) -> None:
         request = flow.request

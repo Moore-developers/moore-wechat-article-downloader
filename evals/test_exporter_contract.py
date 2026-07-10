@@ -599,6 +599,53 @@ class ExporterContractTests(unittest.TestCase):
         self.assertEqual(comment, ("elected", "wechat_session_api", 1))
         self.assertEqual(run, ("complete", 1, 0))
 
+    def test_waiting_engagement_run_resumes_without_creating_another_run(self) -> None:
+        self.run_cli("exporter-import-fixture", str(FIXTURE))
+        account_id = self.fixture_account_id()
+        article = self.run_cli("exporter-articles", "--account-id", str(account_id), "--limit", "1")["articles"][0]
+        self.assertTrue(
+            wechat_exporter.resolve_article_context(
+                self.tmp, int(article["id"]), "var comment_id = '12345';", biz="biz-resume"
+            )["ok"]
+        )
+        context_dir = self.tmp / "context"
+        context_dir.mkdir(parents=True, exist_ok=True)
+        (context_dir / "active-proxy-session.json").write_text(json.dumps({"session_id": "proxy-enhancer-test"}), encoding="utf-8")
+        wechat_exporter.credential_capability_path(self.tmp, "proxy-enhancer-test").write_text("capability-test\n", encoding="utf-8")
+        created = wechat_exporter.create_engagement_run(self.tmp, account_id, 1)
+        original = wechat_exporter.broker_request
+
+        def fake_broker_request(_socket: Path, payload: dict, timeout_seconds: float) -> dict:
+            self.assertEqual(timeout_seconds, 180)
+            self.assertEqual(payload["biz"], "biz-resume")
+            return {
+                "ok": True,
+                "articles": [
+                    {
+                        "ok": True,
+                        "article_id": article["id"],
+                        "metrics": {"read_count": 9},
+                        "comments": [],
+                        "comments_complete": True,
+                    }
+                ],
+            }
+
+        try:
+            wechat_exporter.broker_request = fake_broker_request
+            resumed = wechat_exporter.resume_waiting_engagement_runs(self.tmp, "biz-resume")
+        finally:
+            wechat_exporter.broker_request = original
+
+        self.assertTrue(resumed["ok"])
+        self.assertEqual(resumed["run_count"], 1)
+        db = sqlite3.connect(self.tmp / "exporter.sqlite")
+        try:
+            runs = db.execute("SELECT run_id, status FROM engagement_runs").fetchall()
+        finally:
+            db.close()
+        self.assertEqual(runs, [(created["run_id"], "complete")])
+
     def test_init_additively_upgrades_exporter_v3_database(self) -> None:
         db = sqlite3.connect(self.tmp / "exporter.sqlite")
         try:

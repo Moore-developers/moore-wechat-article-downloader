@@ -2187,8 +2187,7 @@ def active_collection_broker(base: Path) -> tuple[Path, str] | None:
     return credential_socket_path(base, session_id), capability
 
 
-def sync_engagement(base: Path, account_id: int, limit: int = 50) -> dict[str, Any]:
-    """Ask the in-memory broker for elected comments and persist only its safe output."""
+def create_engagement_run(base: Path, account_id: int, limit: int = 50) -> dict[str, Any]:
     contexts = ready_engagement_contexts(base, account_id, limit)
     if not contexts:
         return {"ok": False, "status": "missing_context", "error": "no ready article context for this account", "article_count": 0}
@@ -2211,65 +2210,137 @@ def sync_engagement(base: Path, account_id: int, limit: int = 50) -> dict[str, A
         db.commit()
     finally:
         db.close()
+    return {"ok": True, "run_id": run_id, "biz": biz, "contexts": contexts}
+
+
+def contexts_for_engagement_run(base: Path, run_id: str) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    db = connect_db(base)
+    try:
+        row = db.execute("SELECT * FROM engagement_runs WHERE run_id = ?", (run_id,)).fetchone()
+        if not row:
+            return None, []
+        run = dict(row)
+        scope = load_json_text(run.get("scope_json")) or {}
+        ids = [int(value) for value in scope.get("article_ids", []) if str(value).isdigit()]
+        if not ids:
+            return run, []
+        placeholders = ",".join("?" for _ in ids)
+        rows = db.execute(
+            f"SELECT article_id, account_id, biz, msgid, idx, comment_id, url FROM article_contexts WHERE article_id IN ({placeholders}) AND context_status = 'ready'",
+            ids,
+        ).fetchall()
+        by_id = {int(item["article_id"]): dict(item) for item in rows}
+        return run, [by_id[article_id] for article_id in ids if article_id in by_id]
+    finally:
+        db.close()
+
+
+def persist_engagement_payload(db: sqlite3.Connection, run_id: str, payload: dict[str, Any]) -> tuple[int, int]:
+    successes = 0
+    failures = 0
+    for item in payload.get("articles", []):
+        article_id = int(item.get("article_id") or 0)
+        if not item.get("ok") or not article_id:
+            failures += 1
+            continue
+        metrics = item.get("metrics") if isinstance(item.get("metrics"), dict) else {}
+        captured_at = utc_now()
+        db.execute(
+            """
+            INSERT INTO article_metrics
+                (run_id, article_id, source, captured_at, read_count, like_count, old_like_count, share_count, comment_count, raw_json)
+            VALUES (?, ?, 'wechat_session_api', ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(run_id, article_id, source) DO UPDATE SET
+                captured_at = excluded.captured_at,
+                read_count = excluded.read_count,
+                like_count = excluded.like_count,
+                old_like_count = excluded.old_like_count,
+                share_count = excluded.share_count,
+                comment_count = excluded.comment_count,
+                raw_json = excluded.raw_json
+            """,
+            (
+                run_id,
+                article_id,
+                captured_at,
+                maybe_int(metrics.get("read_count")),
+                maybe_int(metrics.get("like_count")),
+                maybe_int(metrics.get("old_like_count")),
+                maybe_int(metrics.get("share_count")),
+                maybe_int(metrics.get("comment_count")),
+                json_dumps(metrics),
+            ),
+        )
+        for comment in item.get("comments", []):
+            if isinstance(comment, dict):
+                upsert_comment_row(db, article_id, {**comment, "complete": 1 if item.get("comments_complete") else 0}, source="wechat_session_api")
+        successes += 1
+    return successes, failures
+
+
+def execute_engagement_run(base: Path, run_id: str) -> dict[str, Any]:
+    """Resume one user-authorized run without exposing credentials outside the broker."""
+    db = connect_db(base)
+    try:
+        claimed = db.execute(
+            "UPDATE engagement_runs SET status = 'engagement_syncing', error = '', updated_at = ? WHERE run_id = ? AND status = 'waiting_credential'",
+            (utc_now(), run_id),
+        ).rowcount
+        db.commit()
+    finally:
+        db.close()
+    if not claimed:
+        return {"ok": False, "run_id": run_id, "status": "not_waiting"}
+    run, contexts = contexts_for_engagement_run(base, run_id)
+    if not run or not contexts:
+        db = connect_db(base)
+        try:
+            db.execute(
+                "UPDATE engagement_runs SET status = 'completed_with_gaps', error = 'article context is no longer ready', updated_at = ? WHERE run_id = ?",
+                (utc_now(), run_id),
+            )
+            db.commit()
+        finally:
+            db.close()
+        return {"ok": False, "run_id": run_id, "status": "missing_context"}
+    biz = str((load_json_text(run["scope_json"]) or {}).get("biz") or "")
     broker = active_collection_broker(base)
-    payload = broker_request(
-        broker[0],
-        {"op": "fetch_engagement", "biz": biz, "articles": contexts, "capability": broker[1]},
-        timeout_seconds=600,
-    ) if broker else {"ok": False, "status": "unavailable", "error": "credential broker is not running"}
-    if payload.get("status") in {"waiting_credential", "unavailable"} or not payload.get("articles"):
+    if not broker:
+        payload = {"ok": False, "status": "unavailable", "error": "credential broker is not running"}
+    else:
+        payload = None
+    successes = 0
+    failures = 0
+    for offset in range(0, len(contexts), 10):
+        if payload is not None:
+            break
+        payload = broker_request(
+            broker[0],
+            {"op": "fetch_engagement", "biz": biz, "articles": contexts[offset : offset + 10], "capability": broker[1]},
+            timeout_seconds=180,
+        )
+        if payload.get("status") in {"waiting_credential", "unavailable"} or not payload.get("articles"):
+            break
+        db = connect_db(base)
+        try:
+            added_successes, added_failures = persist_engagement_payload(db, run_id, payload)
+            successes += added_successes
+            failures += added_failures
+            db.commit()
+        finally:
+            db.close()
+        payload = None
+    if payload is not None:
         error = str(payload.get("error") or "valid credential is unavailable")
         db = connect_db(base)
         try:
-            db.execute("UPDATE engagement_runs SET error = ?, updated_at = ? WHERE run_id = ?", (error, utc_now(), run_id))
+            db.execute("UPDATE engagement_runs SET status = 'waiting_credential', error = ?, updated_at = ? WHERE run_id = ?", (error, utc_now(), run_id))
             db.commit()
         finally:
             db.close()
         return {"ok": False, "run_id": run_id, "status": "waiting_credential", "article_count": len(contexts), "error": error}
-
-    successes = 0
-    failures = 0
     db = connect_db(base)
     try:
-        for item in payload.get("articles", []):
-            article_id = int(item.get("article_id") or 0)
-            if not item.get("ok") or not article_id:
-                failures += 1
-                continue
-            metrics = item.get("metrics") if isinstance(item.get("metrics"), dict) else {}
-            captured_at = utc_now()
-            db.execute(
-                """
-                INSERT INTO article_metrics
-                    (run_id, article_id, source, captured_at, read_count, like_count, old_like_count, share_count, comment_count, raw_json)
-                VALUES (?, ?, 'wechat_session_api', ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(run_id, article_id, source) DO UPDATE SET
-                    captured_at = excluded.captured_at,
-                    read_count = excluded.read_count,
-                    like_count = excluded.like_count,
-                    old_like_count = excluded.old_like_count,
-                    share_count = excluded.share_count,
-                    comment_count = excluded.comment_count,
-                    raw_json = excluded.raw_json
-                """,
-                (
-                    run_id,
-                    article_id,
-                    captured_at,
-                    maybe_int(metrics.get("read_count")),
-                    maybe_int(metrics.get("like_count")),
-                    maybe_int(metrics.get("old_like_count")),
-                    maybe_int(metrics.get("share_count")),
-                    maybe_int(metrics.get("comment_count")),
-                    json_dumps(metrics),
-                ),
-            )
-            for comment in item.get("comments", []):
-                if not isinstance(comment, dict):
-                    continue
-                comment = {**comment, "complete": 1 if item.get("comments_complete") else 0}
-                upsert_comment_row(db, article_id, comment, source="wechat_session_api")
-            successes += 1
         status = "complete" if failures == 0 else "partial"
         db.execute(
             """
@@ -2291,6 +2362,26 @@ def sync_engagement(base: Path, account_id: int, limit: int = 50) -> dict[str, A
         "failed_count": failures,
         "comment_scope": "elected",
     }
+
+
+def sync_engagement(base: Path, account_id: int, limit: int = 50) -> dict[str, Any]:
+    created = create_engagement_run(base, account_id, limit)
+    if not created.get("ok"):
+        return created
+    result = execute_engagement_run(base, str(created["run_id"]))
+    return {**result, "representative_url": str(created["contexts"][0].get("url") or "")}
+
+
+def resume_waiting_engagement_runs(base: Path, biz: str = "") -> dict[str, Any]:
+    init_exporter_db(base)
+    db = connect_db(base)
+    try:
+        rows = db.execute("SELECT run_id, scope_json FROM engagement_runs WHERE status = 'waiting_credential' ORDER BY created_at").fetchall()
+    finally:
+        db.close()
+    run_ids = [str(row["run_id"]) for row in rows if not biz or str((load_json_text(row["scope_json"]) or {}).get("biz") or "") == biz]
+    results = [execute_engagement_run(base, run_id) for run_id in run_ids]
+    return {"ok": all(result.get("ok") for result in results), "run_count": len(results), "results": results}
 
 
 def list_comments(base: Path, article_id: int, limit: int = 100) -> list[dict[str, Any]]:
@@ -3059,6 +3150,12 @@ def command_wechat_collection_sync_engagement(args: argparse.Namespace) -> int:
     return 0 if result.get("ok") else 1
 
 
+def command_wechat_collection_resume_engagement(args: argparse.Namespace) -> int:
+    result = resume_waiting_engagement_runs(runtime_dir(args.runtime_dir), args.biz)
+    write_json_response(scrub_payload(result))
+    return 0 if result.get("ok") else 1
+
+
 def normalize_match_text(value: Any) -> str:
     return re.sub(r"\s+", "", str(value or "").lower())
 
@@ -3789,6 +3886,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--account-id", type=int, required=True)
     p.add_argument("--limit", type=int, default=50)
     p.set_defaults(func=command_wechat_collection_sync_engagement)
+
+    p = sub.add_parser("wechat-collection-resume-engagement")
+    p.add_argument("--runtime-dir", default=argparse.SUPPRESS)
+    p.add_argument("--biz", default="")
+    p.set_defaults(func=command_wechat_collection_resume_engagement)
 
     p = sub.add_parser("exporter-wizard")
     p.add_argument("--runtime-dir", default=argparse.SUPPRESS)
