@@ -646,6 +646,17 @@ class ExporterContractTests(unittest.TestCase):
             db.close()
         self.assertEqual(runs, [(created["run_id"], "complete")])
 
+    def test_library_dataset_manifest_is_local_and_contains_article_state(self) -> None:
+        self.run_cli("exporter-import-fixture", str(FIXTURE))
+        account_id = self.fixture_account_id()
+        result = wechat_exporter.create_dataset_manifest(self.tmp, account_id, "test-dataset", str(self.tmp / "library"))
+        self.assertTrue(result["ok"])
+        manifest = json.loads(Path(result["manifest"]).read_text(encoding="utf-8"))
+        self.assertEqual(manifest["dataset_id"], "test-dataset")
+        self.assertEqual(manifest["article_count"], 3)
+        self.assertIn("content_status", manifest["articles"][0])
+        self.assertTrue(Path(result["csv"]).exists())
+
     def test_init_additively_upgrades_exporter_v3_database(self) -> None:
         db = sqlite3.connect(self.tmp / "exporter.sqlite")
         try:

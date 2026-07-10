@@ -41,6 +41,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 from wechat_downloader import (  # noqa: E402
     DEFAULT_DELIVERY_DIR,
     clean_url,
+    copy_to_clipboard,
     extract_wechat_article_context,
     make_run_id,
     run_markdown_only_download,
@@ -2369,7 +2370,17 @@ def sync_engagement(base: Path, account_id: int, limit: int = 50) -> dict[str, A
     if not created.get("ok"):
         return created
     result = execute_engagement_run(base, str(created["run_id"]))
-    return {**result, "representative_url": str(created["contexts"][0].get("url") or "")}
+    representative_url = str(created["contexts"][0].get("url") or "")
+    if result.get("status") != "waiting_credential" or not representative_url:
+        return {**result, "representative_url": representative_url}
+    copied, clipboard_method = copy_to_clipboard(representative_url)
+    return {
+        **result,
+        "representative_url": representative_url,
+        "copied_to_clipboard": copied,
+        "clipboard_method": clipboard_method if copied else "",
+        "clipboard_error": "" if copied else clipboard_method,
+    }
 
 
 def resume_waiting_engagement_runs(base: Path, biz: str = "") -> dict[str, Any]:
@@ -2382,6 +2393,84 @@ def resume_waiting_engagement_runs(base: Path, biz: str = "") -> dict[str, Any]:
     run_ids = [str(row["run_id"]) for row in rows if not biz or str((load_json_text(row["scope_json"]) or {}).get("biz") or "") == biz]
     results = [execute_engagement_run(base, run_id) for run_id in run_ids]
     return {"ok": all(result.get("ok") for result in results), "run_count": len(results), "results": results}
+
+
+def create_dataset_manifest(base: Path, account_id: int, dataset_id: str = "", output_root: str = "") -> dict[str, Any]:
+    """Publish a local-only dataset descriptor for downstream reading and analysis."""
+    init_exporter_db(base)
+    db = connect_db(base)
+    try:
+        account = db.execute("SELECT nickname FROM target_accounts WHERE id = ?", (account_id,)).fetchone()
+        if not account:
+            return {"ok": False, "error": "account not found"}
+        rows = db.execute(
+            """
+            SELECT a.id, a.title, a.url, a.publish_time, a.content_downloaded,
+                   c.context_status, c.biz,
+                   (SELECT captured_at FROM article_metrics m WHERE m.article_id = a.id ORDER BY m.captured_at DESC LIMIT 1) AS metrics_captured_at,
+                   (SELECT source FROM article_metrics m WHERE m.article_id = a.id ORDER BY m.captured_at DESC LIMIT 1) AS metrics_source,
+                   (SELECT COUNT(*) FROM article_comments ac WHERE ac.article_id = a.id AND ac.comment_scope = 'elected') AS elected_comment_count
+            FROM articles a
+            LEFT JOIN article_contexts c ON c.article_id = a.id
+            WHERE a.account_id = ?
+            ORDER BY a.publish_time DESC, a.id DESC
+            """,
+            (account_id,),
+        ).fetchall()
+    finally:
+        db.close()
+    account_name = str(account["nickname"] or "account")
+    account_dir = account_output_dir(output_root, account_name)
+    index = read_account_index(account_dir)
+    dataset_id = safe_name(dataset_id or f"dataset-{make_run_id()}", 80)
+    dataset_dir = account_dir / "datasets" / dataset_id
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    articles = []
+    for row in rows:
+        item = dict(row)
+        indexed = index.get(str(item["id"])) or index.get(str(item["url"])) or {}
+        markdown = str(indexed.get("markdown_path") or "")
+        markdown_path = str((account_dir / markdown).resolve()) if markdown and not Path(markdown).is_absolute() else markdown
+        articles.append(
+            {
+                "article_id": int(item["id"]),
+                "title": str(item["title"] or ""),
+                "url": str(item["url"] or ""),
+                "publish_time": str(item["publish_time"] or ""),
+                "markdown_path": markdown_path,
+                "content_status": "ready" if item["content_downloaded"] and markdown_path else "missing",
+                "context_status": str(item["context_status"] or "missing"),
+                "engagement": {
+                    "source": str(item["metrics_source"] or "missing"),
+                    "captured_at": str(item["metrics_captured_at"] or ""),
+                    "comment_scope": "elected",
+                    "elected_comment_count": int(item["elected_comment_count"] or 0),
+                },
+            }
+        )
+    manifest = {
+        "version": 1,
+        "dataset_id": dataset_id,
+        "account_id": account_id,
+        "account_name": account_name,
+        "created_at": utc_now(),
+        "article_count": len(articles),
+        "articles": articles,
+    }
+    manifest_path = dataset_dir / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    csv_path = dataset_dir / "manifest.csv"
+    with csv_path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=["article_id", "title", "url", "publish_time", "markdown_path", "content_status", "context_status", "metrics_source", "metrics_captured_at", "elected_comment_count"])
+        writer.writeheader()
+        for item in articles:
+            writer.writerow({
+                "article_id": item["article_id"], "title": item["title"], "url": item["url"], "publish_time": item["publish_time"],
+                "markdown_path": item["markdown_path"], "content_status": item["content_status"], "context_status": item["context_status"],
+                "metrics_source": item["engagement"]["source"], "metrics_captured_at": item["engagement"]["captured_at"],
+                "elected_comment_count": item["engagement"]["elected_comment_count"],
+            })
+    return {"ok": True, "dataset_id": dataset_id, "manifest": str(manifest_path), "csv": str(csv_path), "article_count": len(articles)}
 
 
 def list_comments(base: Path, article_id: int, limit: int = 100) -> list[dict[str, Any]]:
@@ -3156,6 +3245,12 @@ def command_wechat_collection_resume_engagement(args: argparse.Namespace) -> int
     return 0 if result.get("ok") else 1
 
 
+def command_library_dataset(args: argparse.Namespace) -> int:
+    result = create_dataset_manifest(runtime_dir(args.runtime_dir), args.account_id, args.dataset_id, args.output_dir)
+    write_json_response(scrub_payload(result))
+    return 0 if result.get("ok") else 1
+
+
 def normalize_match_text(value: Any) -> str:
     return re.sub(r"\s+", "", str(value or "").lower())
 
@@ -3891,6 +3986,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--runtime-dir", default=argparse.SUPPRESS)
     p.add_argument("--biz", default="")
     p.set_defaults(func=command_wechat_collection_resume_engagement)
+
+    p = sub.add_parser("library-dataset")
+    p.add_argument("--runtime-dir", default=argparse.SUPPRESS)
+    p.add_argument("--account-id", type=int, required=True)
+    p.add_argument("--dataset-id", default="")
+    p.add_argument("--output-dir", default="")
+    p.set_defaults(func=command_library_dataset)
 
     p = sub.add_parser("exporter-wizard")
     p.add_argument("--runtime-dir", default=argparse.SUPPRESS)
