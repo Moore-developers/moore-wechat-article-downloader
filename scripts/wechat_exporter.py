@@ -41,6 +41,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 from wechat_downloader import (  # noqa: E402
     DEFAULT_DELIVERY_DIR,
     clean_url,
+    extract_wechat_article_context,
     make_run_id,
     run_markdown_only_download,
     runtime_dir,
@@ -100,14 +101,6 @@ ARTICLE_FIELDS = [
     "created_at",
     "updated_at",
 ]
-
-COMMENT_ID_PATTERNS = (
-    re.compile(r"var\s+comment_id\s*=\s*['\"](?P<value>\d+)['\"]", re.I),
-    re.compile(r"comment_id\s*:\s*JsDecode\(['\"](?P<value>\d+)['\"]\)", re.I),
-    re.compile(r"comment_id\.DATA'\)\s*:\s*['\"](?P<value>\d+)['\"]", re.I),
-    re.compile(r"window\.comment_id\s*=\s*['\"](?P<value>\d+)['\"]", re.I),
-)
-
 
 def login_dir(base: Path) -> Path:
     return base / "exporter-login"
@@ -988,11 +981,7 @@ def maybe_int(value: Any) -> int | None:
 
 
 def extract_comment_id_from_html(value: str) -> str:
-    for pattern in COMMENT_ID_PATTERNS:
-        match = pattern.search(value or "")
-        if match:
-            return str(match.group("value") or "")
-    return ""
+    return extract_wechat_article_context(value, "").get("comment_id", "")
 
 
 def biz_from_article_url(value: str) -> str:
@@ -1009,6 +998,7 @@ def resolve_article_context(
     html_text: str = "",
     biz: str = "",
     source: str = "html",
+    comment_id: str = "",
 ) -> dict[str, Any]:
     """Store only non-sensitive article identifiers needed by a future worker."""
     init_exporter_db(base)
@@ -1046,9 +1036,9 @@ def resolve_article_context(
                 """,
                 (account_id, resolved_biz, source, now, now),
             )
-        comment_id = extract_comment_id_from_html(html_text)
+        resolved_comment_id = str(comment_id or extract_comment_id_from_html(html_text)).strip()
         msgid = str(row["msgid"] or "")
-        status = "ready" if resolved_biz and msgid and comment_id else "incomplete"
+        status = "ready" if resolved_biz and msgid and resolved_comment_id else "incomplete"
         db.execute(
             """
             INSERT INTO article_contexts
@@ -1072,7 +1062,7 @@ def resolve_article_context(
                 resolved_biz,
                 msgid,
                 int(row["idx"] or 0),
-                comment_id,
+                resolved_comment_id,
                 str(row["url"] or ""),
                 status,
                 source,
@@ -1800,6 +1790,11 @@ def download_account_articles(
         {"mode": "exporter-download", "article_ids": article_ids, "account": account_name, "file_stems": file_stems},
         run_id,
     )
+    context_by_url = {
+        str(item.get("source_url") or ""): item.get("article_context")
+        for item in manifest.get("articles", [])
+        if isinstance(item.get("article_context"), dict)
+    }
     write_account_index(out_dir, rows_to_download, manifest, run_id)
     success_urls = {item.get("source_url") for item in manifest.get("articles", [])}
     db = connect_db(base)
@@ -1817,6 +1812,19 @@ def download_account_articles(
         db.commit()
     finally:
         db.close()
+    context_results = []
+    for article_id, url in pairs:
+        context = context_by_url.get(url)
+        if context:
+            context_results.append(
+                resolve_article_context(
+                    base,
+                    article_id,
+                    biz=str(context.get("biz") or ""),
+                    comment_id=str(context.get("comment_id") or ""),
+                    source="public_html",
+                )
+            )
     return {
         "ok": manifest["failure_count"] == 0,
         "run_id": manifest["run_id"],
@@ -1831,6 +1839,7 @@ def download_account_articles(
         "redownload_count": redownload_count,
         "skipped": skipped,
         "failed": manifest["failed"],
+        "article_contexts": context_results,
     }
 
 
@@ -2891,7 +2900,9 @@ def command_article_context(args: argparse.Namespace) -> int:
     html_text = ""
     if args.html_file:
         html_text = Path(args.html_file).expanduser().read_text(encoding="utf-8")
-    result = resolve_article_context(runtime_dir(args.runtime_dir), args.article_id, html_text, args.biz, args.source)
+    result = resolve_article_context(
+        runtime_dir(args.runtime_dir), args.article_id, html_text, args.biz, args.source, args.comment_id
+    )
     write_json_response(scrub_payload(result))
     return 0 if result.get("ok") else 1
 
@@ -3617,7 +3628,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--article-id", type=int, required=True)
     p.add_argument("--html-file", default="", help="Local article HTML used only to parse non-sensitive context")
     p.add_argument("--biz", default="", help="Explicit public-account __biz; not a credential")
-    p.add_argument("--source", default="html", choices=["html", "snapshot", "manual"])
+    p.add_argument("--comment-id", default="", help="Explicit non-sensitive article comment ID")
+    p.add_argument("--source", default="html", choices=["html", "snapshot", "manual", "public_html"])
     p.set_defaults(func=command_article_context)
 
     p = sub.add_parser("exporter-wizard")

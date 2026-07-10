@@ -488,6 +488,60 @@ class ExporterContractTests(unittest.TestCase):
         self.assertFalse(conflict["ok"])
         self.assertEqual(conflict["context_status"], "mapping_conflict")
 
+    def test_exporter_download_persists_only_non_sensitive_article_context(self) -> None:
+        self.run_cli("exporter-import-fixture", str(FIXTURE))
+        article_id = int(self.run_cli("exporter-articles", "--limit", "1")["articles"][0]["id"])
+        article = wechat_exporter.get_article_download_rows(self.tmp, [article_id])[0]
+        original = wechat_exporter.run_markdown_only_download
+
+        def fake_download(urls: list[str], output_dir: Path, _assets: bool, _payload: dict, run_id: str) -> dict:
+            self.assertEqual(urls, [article["url"]])
+            output_dir.mkdir(parents=True, exist_ok=True)
+            return {
+                "ok": True,
+                "run_id": run_id,
+                "output_dir": str(output_dir),
+                "index": str(output_dir / "index.csv"),
+                "success_count": 1,
+                "failure_count": 0,
+                "articles": [
+                    {
+                        "seq": "001",
+                        "article_id": "local-article",
+                        "source_url": article["url"],
+                        "status": "success",
+                        "article_context": {"biz": "biz-local", "comment_id": "12345"},
+                    }
+                ],
+                "failed": [],
+            }
+
+        try:
+            wechat_exporter.run_markdown_only_download = fake_download
+            result = wechat_exporter.download_account_articles(self.tmp, [article], str(self.tmp / "delivery"))
+        finally:
+            wechat_exporter.run_markdown_only_download = original
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["article_contexts"][0]["context_status"], "ready")
+        db = sqlite3.connect(self.tmp / "exporter.sqlite")
+        try:
+            context = db.execute(
+                "SELECT biz, comment_id, source FROM article_contexts WHERE article_id = ?", (article["id"],)
+            ).fetchone()
+            serialized = "\n".join(str(value) for row in db.execute("SELECT * FROM article_contexts") for value in row)
+        finally:
+            db.close()
+        self.assertEqual(context, ("biz-local", "12345", "public_html"))
+        self.assertNotIn("pass_ticket", serialized)
+
+    def test_article_context_parser_returns_only_safe_identifiers(self) -> None:
+        context = wechat_exporter.extract_wechat_article_context(
+            "var __biz = 'MzIxNTA1MDEwNg=='; var comment_id = '12345'; var key = 'secret';",
+            "https://mp.weixin.qq.com/s/demo?pass_ticket=secret",
+        )
+        self.assertEqual(context, {"biz": "MzIxNTA1MDEwNg==", "comment_id": "12345"})
+
     def test_init_additively_upgrades_exporter_v3_database(self) -> None:
         db = sqlite3.connect(self.tmp / "exporter.sqlite")
         try:

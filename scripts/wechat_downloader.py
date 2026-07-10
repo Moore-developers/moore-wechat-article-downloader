@@ -563,6 +563,22 @@ def extract_account_clues(raw_html: str, url: str, meta: dict[str, str]) -> dict
     }
 
 
+def extract_wechat_article_context(raw_html: str, url: str) -> dict[str, str]:
+    """Return only non-sensitive identifiers required for later local work."""
+    meta = extract_meta(raw_html, url)
+    clues = extract_account_clues(raw_html, url, meta)
+    comment_id = first_regex(
+        [
+            r"var\s+comment_id\s*=\s*['\"](\d+)['\"]",
+            r"comment_id\s*:\s*JsDecode\(['\"](\d+)['\"]\)",
+            r"comment_id\.DATA'\)\s*:\s*['\"](\d+)['\"]",
+            r"window\.comment_id\s*=\s*['\"](\d+)['\"]",
+        ],
+        raw_html,
+    )
+    return {"biz": clues["biz"], "comment_id": comment_id}
+
+
 def find_article_html(raw_html: str) -> str:
     match = re.search(r'<div\b[^>]*id=["\']js_content["\'][^>]*>', raw_html, re.I)
     if not match:
@@ -3381,6 +3397,7 @@ def download_one_markdown_only(
         "image_count": image_count,
         "read_count": meta.get("read_count", ""),
         "like_count": meta.get("like_count", ""),
+        "article_context": extract_wechat_article_context(raw, cleaned),
         "status": "success",
         "error": "; ".join(error for error in image_errors if error),
         "absolute_markdown_path": str(article_path),
