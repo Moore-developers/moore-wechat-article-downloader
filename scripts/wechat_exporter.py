@@ -2236,13 +2236,17 @@ def contexts_for_engagement_run(base: Path, run_id: str) -> tuple[dict[str, Any]
         db.close()
 
 
-def persist_engagement_payload(db: sqlite3.Connection, run_id: str, payload: dict[str, Any]) -> tuple[int, int]:
+def persist_engagement_payload(db: sqlite3.Connection, run_id: str, payload: dict[str, Any]) -> tuple[int, int, list[str]]:
     successes = 0
     failures = 0
+    errors: list[str] = []
     for item in payload.get("articles", []):
         article_id = int(item.get("article_id") or 0)
         if not item.get("ok") or not article_id:
             failures += 1
+            error = str(item.get("error") or "engagement_request_failed")
+            if error not in errors:
+                errors.append(error)
             continue
         metrics = item.get("metrics") if isinstance(item.get("metrics"), dict) else {}
         captured_at = utc_now()
@@ -2276,7 +2280,7 @@ def persist_engagement_payload(db: sqlite3.Connection, run_id: str, payload: dic
             if isinstance(comment, dict):
                 upsert_comment_row(db, article_id, {**comment, "complete": 1 if item.get("comments_complete") else 0}, source="wechat_session_api")
         successes += 1
-    return successes, failures
+    return successes, failures, errors
 
 
 def execute_engagement_run(base: Path, run_id: str) -> dict[str, Any]:
@@ -2312,6 +2316,7 @@ def execute_engagement_run(base: Path, run_id: str) -> dict[str, Any]:
         payload = None
     successes = 0
     failures = 0
+    failure_errors: list[str] = []
     for offset in range(0, len(contexts), 10):
         if payload is not None:
             break
@@ -2324,9 +2329,10 @@ def execute_engagement_run(base: Path, run_id: str) -> dict[str, Any]:
             break
         db = connect_db(base)
         try:
-            added_successes, added_failures = persist_engagement_payload(db, run_id, payload)
+            added_successes, added_failures, added_errors = persist_engagement_payload(db, run_id, payload)
             successes += added_successes
             failures += added_failures
+            failure_errors.extend(error for error in added_errors if error not in failure_errors)
             db.commit()
         finally:
             db.close()
@@ -2346,10 +2352,10 @@ def execute_engagement_run(base: Path, run_id: str) -> dict[str, Any]:
         db.execute(
             """
             UPDATE engagement_runs
-            SET status = ?, success_count = ?, failed_count = ?, error = '', updated_at = ?
+            SET status = ?, success_count = ?, failed_count = ?, error = ?, updated_at = ?
             WHERE run_id = ?
             """,
-            (status, successes, failures, utc_now(), run_id),
+            (status, successes, failures, "; ".join(failure_errors), utc_now(), run_id),
         )
         db.commit()
     finally:
@@ -2361,6 +2367,7 @@ def execute_engagement_run(base: Path, run_id: str) -> dict[str, Any]:
         "article_count": len(contexts),
         "success_count": successes,
         "failed_count": failures,
+        "errors": failure_errors,
         "comment_scope": "elected",
     }
 

@@ -17,6 +17,7 @@ import socket
 import threading
 import time
 import urllib.parse
+import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -201,8 +202,14 @@ class WeChatCredentialBroker:
                 "comments_complete": complete,
                 "comment_scope": "elected",
             }
+        except urllib.error.HTTPError as exc:
+            return {"ok": False, "article_id": article_id, "error": f"http_{exc.code}"}
+        except urllib.error.URLError:
+            return {"ok": False, "article_id": article_id, "error": "network_error"}
+        except TimeoutError:
+            return {"ok": False, "article_id": article_id, "error": "timeout"}
         except Exception:
-            return {"ok": False, "article_id": article_id, "error": "engagement request failed"}
+            return {"ok": False, "article_id": article_id, "error": "engagement_request_failed"}
 
     def _fetch_elected_comments(
         self,
