@@ -84,7 +84,11 @@ class ExporterContractTests(unittest.TestCase):
             self.assertIn("collections", tables)
             self.assertIn("field_presets", tables)
             self.assertIn("wizard_sessions", tables)
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], wechat_exporter.EXPORTER_DB_VERSION)
+            self.assertIn("account_biz_mappings", tables)
+            self.assertIn("article_contexts", tables)
+            self.assertIn("article_metrics", tables)
+            self.assertIn("article_comment_replies", tables)
         finally:
             db.close()
 
@@ -427,6 +431,97 @@ class ExporterContractTests(unittest.TestCase):
         comments = self.run_cli("exporter-comments", "--article-id", str(article["id"]))
         self.assertEqual(comments["count"], 1)
         self.assertEqual(comments["comments"][0]["content"], "有用")
+
+        payload = self.run_cli("exporter-comments-import", comment)
+        self.assertEqual(payload["inserted_count"], 1)
+        comments = self.run_cli("exporter-comments", "--article-id", str(article["id"]))
+        self.assertEqual(comments["count"], 1)
+        self.assertEqual(comments["comments"][0]["comment_scope"], "elected")
+
+    def test_context_resolution_requires_unique_biz_mapping(self) -> None:
+        self.run_cli("exporter-import-fixture", str(FIXTURE))
+        article = self.run_cli("exporter-articles", "--limit", "1")["articles"][0]
+        context = wechat_exporter.resolve_article_context(
+            self.tmp,
+            int(article["id"]),
+            "var comment_id = '12345' || '0';",
+            biz="biz-demo",
+        )
+        self.assertTrue(context["ok"])
+        self.assertEqual(context["context"]["comment_id"], "12345")
+        self.assertEqual(context["context"]["biz"], "biz-demo")
+
+        account = wechat_exporter.upsert_account(
+            self.tmp,
+            {"fakeid": "fakeid-other", "nickname": "另一个账号"},
+        )["account"]
+        wechat_exporter.upsert_articles(
+            self.tmp,
+            [
+                {
+                    "account_id": int(account["id"]),
+                    "msgid": "other-msgid",
+                    "idx": 1,
+                    "title": "另一篇文章",
+                    "url": "https://mp.weixin.qq.com/s/other",
+                    "digest": "",
+                    "cover_url": "",
+                    "author": "",
+                    "publish_time": "",
+                    "create_time": "",
+                    "is_original": 0,
+                    "is_deleted": 0,
+                    "article_status": "",
+                    "content_downloaded": 0,
+                    "collection_title": "",
+                    "raw_json": "{}",
+                }
+            ],
+        )
+        other = wechat_exporter.list_articles(self.tmp, int(account["id"]))[0]
+        conflict = wechat_exporter.resolve_article_context(
+            self.tmp,
+            int(other["id"]),
+            "var comment_id = '67890' || '0';",
+            biz="biz-demo",
+        )
+        self.assertFalse(conflict["ok"])
+        self.assertEqual(conflict["context_status"], "mapping_conflict")
+
+    def test_init_additively_upgrades_exporter_v3_database(self) -> None:
+        db = sqlite3.connect(self.tmp / "exporter.sqlite")
+        try:
+            db.executescript(
+                """
+                CREATE TABLE article_comments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    article_id INTEGER NOT NULL,
+                    comment_id TEXT NOT NULL DEFAULT '',
+                    nick_name TEXT NOT NULL DEFAULT '',
+                    content TEXT NOT NULL DEFAULT '',
+                    like_count INTEGER,
+                    create_time TEXT NOT NULL DEFAULT '',
+                    raw_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL
+                );
+                INSERT INTO article_comments (article_id, comment_id, created_at) VALUES (1, '', 'old');
+                PRAGMA user_version = 3;
+                """
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        payload = wechat_exporter.init_exporter_db(self.tmp)
+        self.assertTrue(payload["ok"])
+        db = sqlite3.connect(self.tmp / "exporter.sqlite")
+        try:
+            columns = {row[1] for row in db.execute("PRAGMA table_info(article_comments)")}
+            self.assertTrue({"comment_scope", "source", "fetched_at", "complete"}.issubset(columns))
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], wechat_exporter.EXPORTER_DB_VERSION)
+            self.assertEqual(db.execute("SELECT comment_id FROM article_comments").fetchone()[0], "legacy-1")
+        finally:
+            db.close()
 
 
 if __name__ == "__main__":

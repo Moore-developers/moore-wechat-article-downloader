@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import hashlib
 import html
 import http.cookiejar
 import json
@@ -52,6 +53,7 @@ from wechat_downloader import (  # noqa: E402
 
 
 DEFAULT_BASE_URL = "https://down.mptext.top"
+EXPORTER_DB_VERSION = 5
 ARTICLE_URL_RE = re.compile(r"https?://mp\.weixin\.qq\.com/[^\s\"'<>]+", re.I)
 DEFAULT_VISIBLE_FIELDS = [
     "title",
@@ -98,6 +100,13 @@ ARTICLE_FIELDS = [
     "created_at",
     "updated_at",
 ]
+
+COMMENT_ID_PATTERNS = (
+    re.compile(r"var\s+comment_id\s*=\s*['\"](?P<value>\d+)['\"]", re.I),
+    re.compile(r"comment_id\s*:\s*JsDecode\(['\"](?P<value>\d+)['\"]\)", re.I),
+    re.compile(r"comment_id\.DATA'\)\s*:\s*['\"](?P<value>\d+)['\"]", re.I),
+    re.compile(r"window\.comment_id\s*=\s*['\"](?P<value>\d+)['\"]", re.I),
+)
 
 
 def login_dir(base: Path) -> Path:
@@ -175,6 +184,125 @@ def load_json_text(value: str) -> Any:
         return json.loads(value)
     except json.JSONDecodeError:
         return None
+
+
+def ensure_exporter_column(db: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    columns = {str(row[1]) for row in db.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in columns:
+        db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def migrate_exporter_db(db: sqlite3.Connection) -> None:
+    """Apply additive, idempotent migrations for local-only article metadata."""
+    ensure_exporter_column(db, "article_comments", "comment_scope", "TEXT NOT NULL DEFAULT 'elected'")
+    ensure_exporter_column(db, "article_comments", "source", "TEXT NOT NULL DEFAULT 'import'")
+    ensure_exporter_column(db, "article_comments", "fetched_at", "TEXT NOT NULL DEFAULT ''")
+    ensure_exporter_column(db, "article_comments", "complete", "INTEGER NOT NULL DEFAULT 0")
+    db.execute("UPDATE article_comments SET comment_scope = 'elected' WHERE TRIM(comment_scope) = ''")
+    db.execute("UPDATE article_comments SET source = 'import' WHERE TRIM(source) = ''")
+    db.execute("UPDATE article_comments SET fetched_at = created_at WHERE TRIM(fetched_at) = ''")
+    db.execute("UPDATE article_comments SET comment_id = 'legacy-' || id WHERE TRIM(comment_id) = ''")
+    db.execute(
+        """
+        DELETE FROM article_comments
+        WHERE id NOT IN (
+            SELECT MIN(id)
+            FROM article_comments
+            GROUP BY article_id, comment_id, comment_scope
+        )
+        """
+    )
+    db.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_article_comments_identity "
+        "ON article_comments(article_id, comment_id, comment_scope)"
+    )
+    db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS account_biz_mappings (
+            account_id INTEGER PRIMARY KEY,
+            biz TEXT NOT NULL UNIQUE,
+            source TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'verified',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(account_id) REFERENCES target_accounts(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS article_contexts (
+            article_id INTEGER PRIMARY KEY,
+            account_id INTEGER NOT NULL,
+            biz TEXT NOT NULL DEFAULT '',
+            msgid TEXT NOT NULL DEFAULT '',
+            idx INTEGER NOT NULL DEFAULT 0,
+            comment_id TEXT NOT NULL DEFAULT '',
+            url TEXT NOT NULL DEFAULT '',
+            context_status TEXT NOT NULL DEFAULT 'missing',
+            source TEXT NOT NULL DEFAULT '',
+            resolved_at TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(article_id) REFERENCES articles(id),
+            FOREIGN KEY(account_id) REFERENCES target_accounts(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_article_contexts_account_status
+            ON article_contexts(account_id, context_status);
+
+        CREATE TABLE IF NOT EXISTS engagement_runs (
+            run_id TEXT PRIMARY KEY,
+            account_id INTEGER NOT NULL,
+            scope_json TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL,
+            requested_count INTEGER NOT NULL DEFAULT 0,
+            success_count INTEGER NOT NULL DEFAULT 0,
+            failed_count INTEGER NOT NULL DEFAULT 0,
+            credential_expires_at TEXT NOT NULL DEFAULT '',
+            error TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(account_id) REFERENCES target_accounts(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS article_metrics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL DEFAULT '',
+            article_id INTEGER NOT NULL,
+            source TEXT NOT NULL,
+            captured_at TEXT NOT NULL,
+            read_count INTEGER,
+            like_count INTEGER,
+            old_like_count INTEGER,
+            share_count INTEGER,
+            comment_count INTEGER,
+            raw_json TEXT NOT NULL DEFAULT '{}',
+            FOREIGN KEY(article_id) REFERENCES articles(id),
+            UNIQUE(run_id, article_id, source)
+        );
+
+        CREATE TABLE IF NOT EXISTS article_comment_replies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            article_comment_id INTEGER NOT NULL,
+            reply_id TEXT NOT NULL,
+            nick_name TEXT NOT NULL DEFAULT '',
+            content TEXT NOT NULL DEFAULT '',
+            like_count INTEGER,
+            create_time TEXT NOT NULL DEFAULT '',
+            source TEXT NOT NULL DEFAULT '',
+            fetched_at TEXT NOT NULL DEFAULT '',
+            complete INTEGER NOT NULL DEFAULT 0,
+            raw_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(article_comment_id) REFERENCES article_comments(id),
+            UNIQUE(article_comment_id, reply_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS article_write_locks (
+            article_id INTEGER PRIMARY KEY,
+            owner TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(article_id) REFERENCES articles(id)
+        );
+        """
+    )
 
 
 def init_exporter_db(base: Path) -> dict[str, Any]:
@@ -346,7 +474,8 @@ def init_exporter_db(base: Path) -> dict[str, Any]:
             """,
             ("default", json_dumps(DEFAULT_VISIBLE_FIELDS), "markdown", now, now),
         )
-        db.execute("PRAGMA user_version = 3")
+        migrate_exporter_db(db)
+        db.execute(f"PRAGMA user_version = {EXPORTER_DB_VERSION}")
         db.commit()
     finally:
         db.close()
@@ -856,6 +985,156 @@ def maybe_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def extract_comment_id_from_html(value: str) -> str:
+    for pattern in COMMENT_ID_PATTERNS:
+        match = pattern.search(value or "")
+        if match:
+            return str(match.group("value") or "")
+    return ""
+
+
+def biz_from_article_url(value: str) -> str:
+    try:
+        values = urllib.parse.parse_qs(urllib.parse.urlsplit(value).query, keep_blank_values=True)
+    except ValueError:
+        return ""
+    return html.unescape(str((values.get("__biz") or [""])[0])).strip()
+
+
+def resolve_article_context(
+    base: Path,
+    article_id: int,
+    html_text: str = "",
+    biz: str = "",
+    source: str = "html",
+) -> dict[str, Any]:
+    """Store only non-sensitive article identifiers needed by a future worker."""
+    init_exporter_db(base)
+    db = connect_db(base)
+    try:
+        row = db.execute(
+            "SELECT id, account_id, msgid, idx, url FROM articles WHERE id = ?", (article_id,)
+        ).fetchone()
+        if not row:
+            return {"ok": False, "error": "article not found", "article_id": article_id}
+        account_id = int(row["account_id"])
+        resolved_biz = str(biz or biz_from_article_url(str(row["url"] or ""))).strip()
+        mapped = db.execute("SELECT account_id FROM account_biz_mappings WHERE biz = ?", (resolved_biz,)).fetchone() if resolved_biz else None
+        account_mapping = db.execute("SELECT biz FROM account_biz_mappings WHERE account_id = ?", (account_id,)).fetchone()
+        if mapped and int(mapped["account_id"]) != account_id:
+            return {
+                "ok": False,
+                "article_id": article_id,
+                "context_status": "mapping_conflict",
+                "error": "__biz is already mapped to another local account",
+            }
+        if account_mapping and resolved_biz and str(account_mapping["biz"]) != resolved_biz:
+            return {
+                "ok": False,
+                "article_id": article_id,
+                "context_status": "mapping_conflict",
+                "error": "local account is already mapped to another __biz",
+            }
+        now = utc_now()
+        if resolved_biz and not mapped and not account_mapping:
+            db.execute(
+                """
+                INSERT INTO account_biz_mappings (account_id, biz, source, status, created_at, updated_at)
+                VALUES (?, ?, ?, 'verified', ?, ?)
+                """,
+                (account_id, resolved_biz, source, now, now),
+            )
+        comment_id = extract_comment_id_from_html(html_text)
+        msgid = str(row["msgid"] or "")
+        status = "ready" if resolved_biz and msgid and comment_id else "incomplete"
+        db.execute(
+            """
+            INSERT INTO article_contexts
+                (article_id, account_id, biz, msgid, idx, comment_id, url, context_status, source, resolved_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(article_id) DO UPDATE SET
+                account_id = excluded.account_id,
+                biz = CASE WHEN excluded.biz <> '' THEN excluded.biz ELSE article_contexts.biz END,
+                msgid = excluded.msgid,
+                idx = excluded.idx,
+                comment_id = CASE WHEN excluded.comment_id <> '' THEN excluded.comment_id ELSE article_contexts.comment_id END,
+                url = excluded.url,
+                context_status = excluded.context_status,
+                source = excluded.source,
+                resolved_at = excluded.resolved_at,
+                updated_at = excluded.updated_at
+            """,
+            (
+                article_id,
+                account_id,
+                resolved_biz,
+                msgid,
+                int(row["idx"] or 0),
+                comment_id,
+                str(row["url"] or ""),
+                status,
+                source,
+                now,
+                now,
+            ),
+        )
+        db.commit()
+        context = db.execute("SELECT * FROM article_contexts WHERE article_id = ?", (article_id,)).fetchone()
+        return {"ok": status == "ready", "article_id": article_id, "context_status": status, "context": dict(context)}
+    finally:
+        db.close()
+
+
+def comment_identity(row: dict[str, Any]) -> str:
+    value = str(row.get("comment_id") or row.get("id") or "").strip()
+    if value:
+        return value
+    fingerprint = "\n".join(
+        [
+            str(row.get("nick_name") or row.get("nickname") or row.get("user") or ""),
+            str(row.get("content") or row.get("comment") or ""),
+            str(row.get("create_time") or row.get("time") or ""),
+        ]
+    )
+    return "derived-" + hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:24]
+
+
+def upsert_comment_row(db: sqlite3.Connection, article_id: int, row: dict[str, Any], source: str = "import") -> None:
+    now = utc_now()
+    scope = str(row.get("comment_scope") or row.get("scope") or "elected").strip() or "elected"
+    db.execute(
+        """
+        INSERT INTO article_comments
+            (article_id, comment_id, nick_name, content, like_count, create_time, raw_json, created_at,
+             comment_scope, source, fetched_at, complete)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(article_id, comment_id, comment_scope) DO UPDATE SET
+            nick_name = excluded.nick_name,
+            content = excluded.content,
+            like_count = excluded.like_count,
+            create_time = excluded.create_time,
+            raw_json = excluded.raw_json,
+            source = excluded.source,
+            fetched_at = excluded.fetched_at,
+            complete = excluded.complete
+        """,
+        (
+            article_id,
+            comment_identity(row),
+            str(row.get("nick_name") or row.get("nickname") or row.get("user") or ""),
+            str(row.get("content") or row.get("comment") or ""),
+            maybe_int(row.get("like_count") or row.get("like")),
+            parse_time(row.get("create_time") or row.get("time")),
+            json_dumps(scrub_payload(row)),
+            now,
+            scope,
+            str(row.get("source") or source),
+            str(row.get("fetched_at") or now),
+            1 if bool(row.get("complete")) else 0,
+        ),
+    )
 
 
 def search_accounts(base: Path, keyword: str, begin: int = 0, size: int = 10, profile: str = "") -> dict[str, Any]:
@@ -1795,23 +2074,7 @@ def import_comments(base: Path, path_or_json: str) -> dict[str, Any]:
             if not article_id:
                 missing += 1
                 continue
-            db.execute(
-                """
-                INSERT INTO article_comments
-                    (article_id, comment_id, nick_name, content, like_count, create_time, raw_json, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    article_id,
-                    str(row.get("comment_id") or row.get("id") or ""),
-                    str(row.get("nick_name") or row.get("nickname") or row.get("user") or ""),
-                    str(row.get("content") or row.get("comment") or ""),
-                    maybe_int(row.get("like_count") or row.get("like")),
-                    parse_time(row.get("create_time") or row.get("time")),
-                    json_dumps(row),
-                    utc_now(),
-                ),
-            )
+            upsert_comment_row(db, article_id, row)
             inserted += 1
         db.commit()
     finally:
@@ -1853,23 +2116,7 @@ def flush_captured_comments(base: Path) -> dict[str, Any]:
                 if not isinstance(c, dict):
                     continue
                 try:
-                    db.execute(
-                        """
-                        INSERT OR IGNORE INTO article_comments
-                            (article_id, comment_id, nick_name, content, like_count, create_time, raw_json, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            article_id,
-                            str(c.get("comment_id") or ""),
-                            str(c.get("nick_name") or ""),
-                            str(c.get("content") or ""),
-                            maybe_int(c.get("like_count")),
-                            parse_time(c.get("create_time")),
-                            json_dumps(c),
-                            utc_now(),
-                        ),
-                    )
+                    upsert_comment_row(db, article_id, c, source="passive_page")
                     inserted += 1
                 except Exception as exc:
                     errors.append(f"{path.name} comment insert: {exc}")
@@ -1898,6 +2145,7 @@ def list_comments(base: Path, article_id: int, limit: int = 100) -> list[dict[st
         rows = db.execute(
             """
             SELECT id, article_id, comment_id, nick_name, content, like_count, create_time
+                   , comment_scope, source, fetched_at, complete
             FROM article_comments
             WHERE article_id = ?
             ORDER BY create_time DESC, id DESC
