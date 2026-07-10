@@ -164,12 +164,12 @@ SNAPSHOT_SCRIPT = r"""
   function buttonStyle(kind) {
     var size = kind === 'comment' ? {
       margin: '0 0 0 10px',
-      height: '26px',
-      padding: '0 10px',
-      fontSize: '13px'
+      height: '32px',
+      padding: '0 11px',
+      fontSize: '14px'
     } : {
       margin: '0 0 0 8px',
-      height: '24px',
+      height: '28px',
       padding: '0 9px',
       fontSize: '13px'
     };
@@ -182,7 +182,7 @@ SNAPSHOT_SCRIPT = r"""
       'margin:' + size.margin,
       'padding:' + size.padding,
       'border:1px solid #d8e1ef',
-      'border-radius:999px',
+      'border-radius:4px',
       'background:#f7f8fa',
       'color:#576b95',
       'font:inherit',
@@ -195,32 +195,101 @@ SNAPSHOT_SCRIPT = r"""
       'appearance:none',
       '-webkit-appearance:none',
       'white-space:nowrap',
-      'min-width:0'
+      'min-width:0',
+      'gap:5px',
+      'position:relative',
+      'z-index:2147483647',
+      'pointer-events:auto',
+      'user-select:none',
+      '-webkit-user-select:none',
+      'transition:background-color .15s ease,border-color .15s ease,color .15s ease,opacity .15s ease'
     ].join(';') + ';';
+  }
+  function buttonContent(state) {
+    var values = {
+      idle: [String.fromCharCode(0x2606), '收藏到本地'],
+      loading: [String.fromCharCode(0x2026), '收藏中'],
+      success: [String.fromCharCode(0x2713), '已收藏'],
+      error: ['!', '重试收藏']
+    };
+    return values[state] || values.idle;
+  }
+  function renderButtonContent(btn, state) {
+    var value = buttonContent(state);
+    while (btn.firstChild) btn.removeChild(btn.firstChild);
+    var icon = document.createElement('span');
+    icon.setAttribute('aria-hidden', 'true');
+    icon.style.cssText = 'font-size:14px;line-height:1;pointer-events:none';
+    icon.textContent = value[0];
+    var label = document.createElement('span');
+    label.style.cssText = 'pointer-events:none';
+    label.textContent = value[1];
+    btn.appendChild(icon);
+    btn.appendChild(label);
+  }
+  function applyButtonState(btn, state) {
+    var disabled = state === 'loading' || state === 'success';
+    btn.dataset.mooreCaptureState = state;
+    renderButtonContent(btn, state);
+    btn.disabled = disabled;
+    btn.setAttribute('aria-label', state === 'error' ? '收藏失败，点击重试' : (state === 'success' ? '已收藏到本地' : '收藏到本地'));
+    btn.style.opacity = state === 'loading' ? '.72' : '1';
+    btn.style.cursor = disabled ? 'default' : 'pointer';
+    btn.style.background = state === 'success' ? '#f0f7f2' : (state === 'error' ? '#fff5f5' : '#f7f8fa');
+    btn.style.borderColor = state === 'success' ? '#bdd9c5' : (state === 'error' ? '#efc7c7' : '#d8e1ef');
+    btn.style.color = state === 'success' ? '#3f7d52' : (state === 'error' ? '#b34b4b' : '#576b95');
   }
   function allButtons() {
     return Array.prototype.slice.call(document.querySelectorAll('[data-moore-capture-button="1"]'));
   }
-  function setButtonState(text, disabled) {
+  function setButtonState(state) {
     allButtons().forEach(function (btn) {
-      btn.textContent = text;
-      btn.disabled = !!disabled;
-      btn.style.opacity = disabled ? '.72' : '1';
+      applyButtonState(btn, state);
     });
   }
-  function captureSnapshot() {
-    setButtonState('保存中...', true);
-    fetch('/__moore_capture', {
-      method: 'POST',
-      headers: {'content-type': 'application/json'},
-      body: JSON.stringify(collect())
-    }).then(function (r) { return r.json(); }).then(function () {
-      setButtonState('已保存', false);
-      logClient('capture-success', {});
-    }).catch(function () {
-      setButtonState('保存失败', false);
-      logClient('capture-failed', {});
-    });
+  function captureSnapshot(btn) {
+    if (btn && (btn.dataset.mooreCaptureState === 'loading' || btn.dataset.mooreCaptureState === 'success')) return;
+    logClient('capture-start', {kind: btn ? btn.dataset.mooreCaptureKind : ''});
+    setButtonState('loading');
+    setTimeout(function () {
+      fetch('/__moore_capture', {
+        method: 'POST',
+        headers: {'content-type': 'application/json'},
+        body: JSON.stringify(collect())
+      }).then(function (r) {
+        if (!r.ok) throw new Error('capture failed: ' + r.status);
+        return r.json();
+      }).then(function () {
+        setButtonState('success');
+        logClient('capture-success', {});
+      }).catch(function (err) {
+        setButtonState('error');
+        logClient('capture-failed', {message: err && err.message ? err.message : ''});
+      });
+    }, 0);
+  }
+  function buttonFromEvent(ev) {
+    var node = ev && ev.target;
+    while (node && node !== document) {
+      if (node.dataset && node.dataset.mooreCaptureButton === '1') return node;
+      node = node.parentNode;
+    }
+    return null;
+  }
+  function handleButtonActivation(ev) {
+    var btn = buttonFromEvent(ev);
+    if (!btn) return;
+    var now = Date.now();
+    var last = Number(btn.dataset.mooreCaptureLastActivation || 0);
+    if (now - last < 700) {
+      if (ev && ev.preventDefault) ev.preventDefault();
+      if (ev && ev.stopPropagation) ev.stopPropagation();
+      return;
+    }
+    btn.dataset.mooreCaptureLastActivation = String(now);
+    if (ev && ev.preventDefault) ev.preventDefault();
+    if (ev && ev.stopPropagation) ev.stopPropagation();
+    captureSnapshot(btn);
   }
   function ensureButton(id, kind) {
     var btn = document.getElementById(id);
@@ -228,16 +297,23 @@ SNAPSHOT_SCRIPT = r"""
       btn = document.createElement('button');
       btn.id = id;
       btn.type = 'button';
-      btn.textContent = '保存这篇';
       btn.dataset.mooreCaptureButton = '1';
       btn.dataset.mooreCaptureKind = kind || 'meta';
       btn.className = kind === 'comment' ? 'moore_capture_btn_comment' : 'rich_media_meta rich_media_meta_text moore_capture_btn_meta';
       btn.style.cssText = buttonStyle(kind);
-      btn.onmouseenter = function () { btn.style.background = '#eef3fb'; btn.style.borderColor = '#c8d6ea'; };
-      btn.onmouseleave = function () { btn.style.background = '#f7f8fa'; btn.style.borderColor = '#d8e1ef'; };
-      btn.onmousedown = function () { btn.style.background = '#e8eef7'; };
-      btn.onmouseup = function () { btn.style.background = '#eef3fb'; };
-      btn.onclick = captureSnapshot;
+      applyButtonState(btn, 'idle');
+      btn.onmouseenter = function () {
+        if (btn.dataset.mooreCaptureState === 'idle') { btn.style.background = '#eef3fb'; btn.style.borderColor = '#c8d6ea'; }
+      };
+      btn.onmouseleave = function () { applyButtonState(btn, btn.dataset.mooreCaptureState || 'idle'); };
+      btn.onmousedown = function () {
+        if (btn.dataset.mooreCaptureState === 'idle' || btn.dataset.mooreCaptureState === 'error') btn.style.background = '#e8eef7';
+      };
+      btn.onmouseup = function () { applyButtonState(btn, btn.dataset.mooreCaptureState || 'idle'); };
+      btn.onclick = handleButtonActivation;
+      btn.addEventListener('click', handleButtonActivation, true);
+      btn.addEventListener('touchend', handleButtonActivation, true);
+      btn.addEventListener('pointerup', handleButtonActivation, true);
       logClient('button-created', {id: id, kind: kind || 'meta'});
     }
     if (kind === 'comment') placeCommentButton(btn);
@@ -751,6 +827,15 @@ def inject_snapshot_button(text: str) -> str:
     if "</body>" in text.lower():
         return re.sub(r"</body>", lambda match: script + "\n" + match.group(0), text, count=1, flags=re.I)
     return text + script
+
+
+def prevent_article_response_cache(response: Any) -> None:
+    response.headers["cache-control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["pragma"] = "no-cache"
+    response.headers["expires"] = "0"
+    for header in ("etag", "last-modified"):
+        if header in response.headers:
+            del response.headers[header]
 
 
 def metric_value(raw: str) -> dict[str, Any]:
@@ -1297,6 +1382,7 @@ class WeChatHistoryCapture:
             },
         )
         flow.response.set_text(injected_text)
+        prevent_article_response_cache(flow.response)
 
     def _capture_snapshot_post(self, flow: Any) -> None:
         try:

@@ -189,13 +189,15 @@ It must not write or print raw cookies, tokens, pass tickets, keys, or auth head
 
 Use this only when the user asks for current-page deep data: comments, read/like/favorite counts, rendered DOM, or public-account style. Do not use it for ordinary history list retrieval; Exporter remains the default, and the old proxy history flow remains a backup.
 
-Primary flow: start the persistent enhancer session. It routes system HTTP/HTTPS proxy to `23344` so WeChat WebView enters the enhancer. Do not restore automatically after capture; restore only when the user explicitly asks.
+Primary flow: start an enhancer session. Each new session selects a free random port in `23032-24045`, fixes its upstream before changing system settings, and routes system HTTP/HTTPS through that port. Do not restore automatically after capture; restore only when the user explicitly asks.
 
 ```bash
-python3 scripts/wechat_downloader.py proxy-enhancer-session-start --port 23344 --upstream-proxy auto --yes
+python3 scripts/wechat_downloader.py proxy-enhancer-session-start --upstream-proxy auto --yes
 ```
 
-The command starts or reuses the local mitmproxy service, switches the active adapter to `proxy-enhancer`, saves the current system proxy state, and routes HTTP/HTTPS to `127.0.0.1:23344`. It creates:
+The command starts a session-owned mitmproxy process, saves the active port, PID, upstream, and previous system proxy state, then routes HTTP/HTTPS to the selected port. It creates:
+
+After routing is active, it terminates the existing WeChat `WeChatAppEx` process tree without quitting the main WeChat process. Opening an article starts a fresh WebView with the active proxy. Safe enhancer restart repeats this reset so old in-memory pages cannot bypass updated injection code. Injected article HTML is returned with `Cache-Control: no-store`; disabled proxy state is normalized without stale server/port values.
 
 ```text
 ~/.moore/wechat-article-downloader/proxy-snapshots/
@@ -204,27 +206,27 @@ The command starts or reuses the local mitmproxy service, switches the active ad
 Tell the user:
 
 ```text
-重新打开任意公众号文章；等评论/底部互动区加载完成后，点击页面右下角“保存当前页面”。系统代理会保持在 23344，直到你明确要求恢复。
+重新打开任意公众号文章；等评论/底部互动区加载完成后，点击页面中的“收藏到本地”。系统代理会保持在本次会话端口，直到你明确要求恢复。
 ```
 
 Check enhancer status:
 
 ```bash
-python3 scripts/wechat_downloader.py proxy-enhancer-status --port 23344
+python3 scripts/wechat_downloader.py proxy-enhancer-status
 ```
 
 Check routing facts and ingress:
 
 ```bash
-python3 scripts/wechat_downloader.py proxy-enhancer-route-help --port 23344
-python3 scripts/wechat_downloader.py proxy-enhancer-check-ingress --port 23344 --minutes 10
+python3 scripts/wechat_downloader.py proxy-enhancer-route-help
+python3 scripts/wechat_downloader.py proxy-enhancer-check-ingress --minutes 10
 ```
 
 Interpretation:
 
-- `proxy-enhancer-start` keeps `23344` ready and chains outbound to the detected upstream proxy.
-- It does not force WeChat traffic into `23344`.
-- `proxy-enhancer-check-ingress` is the gate: if no article request reached `23344`, the button cannot appear.
+- `proxy-enhancer-session-start` chooses and records the active port before changing system proxy settings.
+- Status, route, restart, and ingress commands read that active port automatically.
+- `proxy-enhancer-check-ingress` is the gate: if no article HTML reached the active port, the button cannot appear.
 
 Read captured snapshots:
 
@@ -276,12 +278,6 @@ This section includes observable metrics and a structured loaded-comments table.
 
 Do not attach raw snapshot directories recursively. The attach step only copies structured extraction output into the user-facing article library.
 
-Stop the enhancer only when the user explicitly asks:
-
-```bash
-python3 scripts/wechat_downloader.py proxy-enhancer-stop --port 23344 --yes
-```
-
 `proxy-snapshot-prepare --yes` is deprecated and should only be used as a debug fallback because it temporarily changes macOS system proxy settings.
 
 Restore system proxy only when the user explicitly asks:
@@ -290,7 +286,7 @@ Restore system proxy only when the user explicitly asks:
 python3 scripts/wechat_downloader.py proxy-enhancer-session-finish --yes
 ```
 
-This does not stop the persistent `23344` proxy service.
+This restores the previous system proxy first, then stops the session-owned enhancer process and releases its random port.
 
 Expected files:
 

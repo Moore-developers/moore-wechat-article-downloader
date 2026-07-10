@@ -22,6 +22,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -40,6 +41,9 @@ from typing import Any
 APP_DIR = Path.home() / ".moore" / "wechat-article-downloader"
 DEFAULT_DELIVERY_DIR = Path.home() / "Downloads" / "wechat-articles"
 DEFAULT_PROXY_PORT = 23344
+PROXY_PORT_MIN = 23032
+PROXY_PORT_MAX = 24045
+WECHAT_WEBVIEW_EXECUTABLE = "/Applications/WeChat.app/Contents/MacOS/WeChatAppEx.app/Contents/MacOS/WeChatAppEx"
 ARTICLE_URL_RE = re.compile(r"https?://mp\.weixin\.qq\.com/[^\s\"'<>]+", re.I)
 IMG_RE = re.compile(r"<img\b[^>]*>", re.I)
 ATTR_RE = re.compile(r"""([:\w-]+)\s*=\s*(['"])(.*?)\2""", re.S)
@@ -80,10 +84,11 @@ WECHAT_HISTORY_USER_AGENT = (
     "MicroMessenger/8.0.49 NetType/WIFI Language/zh_CN"
 )
 WECHAT_RADIUM_DIR = Path.home() / "Library" / "Containers" / "com.tencent.xinWeChat" / "Data" / "Documents" / "app_data" / "radium"
-WECHAT_MITM_HOST_RE = (
-    r"^(?!(?:.*\.)?"
-    r"(?:mp\.weixin\.qq\.com|res\.wx\.qq\.com|mmbiz\.qpic\.cn|support\.weixin\.qq\.com)"
-    r"(?::\d+)?$).*$"
+WECHAT_MITM_ALLOW_HOST_RE = (
+    r"^(?:.*\.)?"
+    r"(?:mp\.weixin\.qq\.com|res\.wx\.qq\.com|mmbiz\.qpic\.cn|support\.weixin\.qq\.com|"
+    r"wxa\.wxs\.qq\.com|wxsmw\.wxs\.qq\.com|wximg\.wxs\.qq\.com|wx\.qlogo\.cn)"
+    r"(?::\d+)?$"
 )
 
 
@@ -812,7 +817,18 @@ def localize_markdown_images(
 
 def write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    payload = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", delete=False) as fh:
+            tmp_path = Path(fh.name)
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path and tmp_path.exists():
+            tmp_path.unlink()
 
 
 def read_json(path: Path) -> Any:
@@ -1697,6 +1713,91 @@ def history_proxy_process_running(pid: int, port: int) -> bool:
     return result.returncode == 0 and "mitmdump" in output and re.search(rf":{port}\b", output) is not None
 
 
+def proxy_port_available(port: int) -> bool:
+    if port < PROXY_PORT_MIN or port > PROXY_PORT_MAX:
+        return False
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(("127.0.0.1", port))
+        except OSError:
+            return False
+    return True
+
+
+def wait_for_proxy_port_available(port: int, timeout: float = 5.0) -> bool:
+    deadline = time.time() + max(timeout, 0)
+    while time.time() < deadline:
+        if proxy_port_available(port):
+            return True
+        time.sleep(0.1)
+    return proxy_port_available(port)
+
+
+def validate_proxy_port(port: int) -> int:
+    selected = int(port)
+    if selected < PROXY_PORT_MIN or selected > PROXY_PORT_MAX:
+        raise ValueError(f"proxy port must be between {PROXY_PORT_MIN} and {PROXY_PORT_MAX}")
+    return selected
+
+
+def choose_proxy_port(port: int | None = None) -> int:
+    if port is not None:
+        selected = validate_proxy_port(port)
+        if not proxy_port_available(selected):
+            raise RuntimeError(f"proxy port is already in use: {selected}")
+        return selected
+    candidates = list(range(PROXY_PORT_MIN, PROXY_PORT_MAX + 1))
+    random.SystemRandom().shuffle(candidates)
+    for selected in candidates:
+        if proxy_port_available(selected):
+            return selected
+    raise RuntimeError(f"no free proxy port between {PROXY_PORT_MIN} and {PROXY_PORT_MAX}")
+
+
+def active_proxy_port(base: Path) -> int | None:
+    active = read_active_proxy_session(base)
+    mode = str(active.get("mode") or "")
+    if mode and mode != "proxy-enhancer":
+        return None
+    if not mode:
+        session_id = str(active.get("session_id") or "")
+        if not session_id.startswith("proxy-enhancer"):
+            return None
+    try:
+        port = int(active.get("port") or 0)
+        pid = int(active.get("pid") or 0)
+    except (TypeError, ValueError):
+        return None
+    return port if port and history_proxy_process_running(pid, port) else None
+
+
+def clear_active_proxy_session(base: Path, pid: int = 0) -> None:
+    path = active_proxy_session_path(base)
+    if not path.exists():
+        return
+    active = read_active_proxy_session(base)
+    if pid:
+        try:
+            active_pid = int(active.get("pid") or 0)
+        except (TypeError, ValueError):
+            return
+        if active_pid != int(pid):
+            return
+    path.unlink()
+
+
+def resolve_proxy_port(base: Path, port: int | None = None, *, require_active: bool = False) -> int:
+    if port is not None:
+        return validate_proxy_port(port)
+    active = active_proxy_port(base)
+    if active:
+        return active
+    if require_active:
+        raise RuntimeError("no active proxy-enhancer session")
+    return choose_proxy_port()
+
+
 def mitm_addon_path() -> Path:
     return Path(__file__).resolve().parent / "wechat_history_mitm_addon.py"
 
@@ -1775,6 +1876,7 @@ def write_active_proxy_session(base: Path, session: dict[str, Any], port: int, p
             "session_id": session["session_id"],
             "account_id": session.get("account_id", ""),
             "account_name": session.get("account_name", ""),
+            "mode": session.get("mode", "history"),
             "port": port,
             "pid": pid,
             "upstream_proxy": upstream_proxy,
@@ -1964,14 +2066,42 @@ def start_history_proxy(base: Path, session: dict[str, Any], port: int, limit: i
         str(port),
         "--set",
         "block_global=false",
-        "--ignore-hosts",
-        WECHAT_MITM_HOST_RE,
+        "--allow-hosts",
+        WECHAT_MITM_ALLOW_HOST_RE,
     ]
     if upstream:
         cmd.extend(["--mode", f"upstream:{upstream}"])
     cmd.extend(["-s", str(addon)])
     proc = subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT, env=env, start_new_session=True)
     log_fh.close()
+    deadline = time.time() + 5
+    while time.time() < deadline and not history_proxy_process_running(proc.pid, port):
+        if proc.poll() is not None:
+            break
+        time.sleep(0.1)
+    if not history_proxy_process_running(proc.pid, port):
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+        return {
+            "ok": False,
+            "error": "proxy process failed its listening-port health check",
+            "pid": proc.pid,
+            "port": port,
+            "log": str(log_path),
+        }
     state = {
         "ok": True,
         "status": "running",
@@ -2148,7 +2278,7 @@ def service_session(base: Path, port: int) -> dict[str, Any]:
 def enhancer_session(base: Path, port: int) -> dict[str, Any]:
     root = auto_snapshot_root(base)
     return {
-        "session_id": "proxy-enhancer",
+        "session_id": f"proxy-enhancer-{make_run_id()}",
         "mode": "proxy-enhancer",
         "status": "running",
         "created_at": utc_now(),
@@ -2179,9 +2309,13 @@ def start_proxy_service(base: Path, port: int = DEFAULT_PROXY_PORT, upstream_pro
     return result
 
 
-def start_proxy_enhancer(base: Path, port: int = DEFAULT_PROXY_PORT, upstream_proxy: str = "auto") -> dict[str, Any]:
+def start_proxy_enhancer(base: Path, port: int | None = None, upstream_proxy: str = "auto") -> dict[str, Any]:
     ensure_runtime(base)
-    setup = proxy_setup_status(port)
+    try:
+        selected_port = choose_proxy_port(port)
+    except (RuntimeError, ValueError) as exc:
+        return {"ok": False, "stage": "port", "error": str(exc)}
+    setup = proxy_setup_status(selected_port)
     if not setup.get("ok"):
         return {
             "ok": False,
@@ -2189,10 +2323,10 @@ def start_proxy_enhancer(base: Path, port: int = DEFAULT_PROXY_PORT, upstream_pr
             "setup": setup,
             "next_step": setup.get("next_step", "Install mitmproxy, then retry proxy-enhancer-start."),
         }
-    session = enhancer_session(base, port)
+    session = enhancer_session(base, selected_port)
     auto_snapshot_root(base).mkdir(parents=True, exist_ok=True)
     save_history_session(base, session)
-    result = start_history_proxy(base, session, port, 1, upstream_proxy)
+    result = start_history_proxy(base, session, selected_port, 1, upstream_proxy)
     if result.get("ok"):
         result = {
             **result,
@@ -2201,8 +2335,8 @@ def start_proxy_enhancer(base: Path, port: int = DEFAULT_PROXY_PORT, upstream_pr
             "snapshot_index": session["snapshot_index"],
             "does_not_modify_system_proxy": True,
             "next_step": (
-                f"Route WeChat traffic to 127.0.0.1:{port} once. "
-                "Then open any WeChat article; the page should show 保存这篇."
+                f"Route WeChat traffic to 127.0.0.1:{selected_port} once. "
+                "Then open any WeChat article; the page should show 收藏到本地."
             ),
         }
         write_proxy_service_state(base, result)
@@ -2238,8 +2372,29 @@ def status_proxy_service(base: Path, port: int = DEFAULT_PROXY_PORT) -> dict[str
     }
 
 
-def status_proxy_enhancer(base: Path, port: int = DEFAULT_PROXY_PORT) -> dict[str, Any]:
-    status = status_proxy_service(base, port)
+def status_proxy_enhancer(base: Path, port: int | None = None) -> dict[str, Any]:
+    try:
+        selected_port = validate_proxy_port(port) if port is not None else active_proxy_port(base)
+    except (TypeError, ValueError) as exc:
+        return {
+            "ok": False,
+            "running": False,
+            "port": None,
+            "proxy": "",
+            "mode": "proxy-enhancer",
+            "error": str(exc),
+        }
+    if selected_port is None:
+        return {
+            "ok": True,
+            "running": False,
+            "port": None,
+            "proxy": "",
+            "system_proxy_points_here": False,
+            "mode": "proxy-enhancer",
+            "next_step": "Run proxy-enhancer-session-start to create a new random-port session.",
+        }
+    status = status_proxy_service(base, selected_port)
     latest = latest_auto_snapshot(base)
     debug_log = auto_snapshot_root(base) / "debug.jsonl"
     return {
@@ -2250,7 +2405,7 @@ def status_proxy_enhancer(base: Path, port: int = DEFAULT_PROXY_PORT) -> dict[st
         "debug_log": str(debug_log),
         "latest_snapshot": latest if latest else {},
         "next_step": (
-            "If WeChat is already routed to this proxy, open an article and click 保存这篇."
+            "If WeChat is already routed to this proxy, open an article and click 收藏到本地."
             if status.get("running")
             else "Run proxy-enhancer-start first."
         ),
@@ -2303,8 +2458,9 @@ def proxy_enhancer_logs(base: Path, hours: int = 24, limit: int = 80) -> dict[st
     }
 
 
-def proxy_enhancer_check_ingress(base: Path, port: int = DEFAULT_PROXY_PORT, minutes: int = 10) -> dict[str, Any]:
+def proxy_enhancer_check_ingress(base: Path, port: int | None = None, minutes: int = 10) -> dict[str, Any]:
     status = status_proxy_enhancer(base, port)
+    selected_port = status.get("port")
     network_path = auto_snapshot_root(base) / "network.jsonl"
     rows = parse_jsonl_tail(network_path, 500)
     cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=max(minutes, 1))
@@ -2325,20 +2481,25 @@ def proxy_enhancer_check_ingress(base: Path, port: int = DEFAULT_PROXY_PORT, min
         "ok": True,
         "mode": "proxy-enhancer",
         "proxy_running": bool(status.get("running")),
-        "proxy": f"127.0.0.1:{port}",
+        "proxy": f"127.0.0.1:{selected_port}" if selected_port else "",
         "upstream_proxy": status.get("upstream_proxy", ""),
         "system_proxy_points_here": bool(status.get("system_proxy_points_here")),
         "network_log": str(network_path),
         "window_minutes": max(minutes, 1),
         "recent_request_count": len(recent_rows),
         "recent_article_page_count": len(article_rows),
-        "wechat_ingress_detected": bool(recent_rows),
+        "resource_ingress_detected": bool(recent_rows),
+        "wechat_ingress_detected": bool(article_rows),
         "article_ingress_detected": bool(article_rows),
         "latest_event": latest,
         "next_step": (
-            "Ingress OK. Open the article and click 保存这篇."
+            "Ingress OK. Open the article and click 收藏到本地."
             if article_rows
-            else "No recent WeChat article request reached 23344. Route WeChat traffic to 127.0.0.1:23344, then reopen the article."
+            else (
+                "WeChat resources reached the enhancer, but the article HTML did not. Reopen the article in WeChat."
+                if recent_rows
+                else "No recent WeChat article traffic reached the active enhancer. Check the active proxy session, then reopen the article."
+            )
         ),
     }
 
@@ -2395,18 +2556,101 @@ def current_system_proxy_summary() -> dict[str, Any]:
     }
 
 
-def proxy_enhancer_route_help(base: Path, port: int = DEFAULT_PROXY_PORT) -> dict[str, Any]:
+def process_table() -> list[dict[str, Any]]:
+    result = subprocess.run(["ps", "-axo", "pid=,ppid=,command="], text=True, capture_output=True, check=False)
+    rows: list[dict[str, Any]] = []
+    for line in result.stdout.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) != 3:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except ValueError:
+            continue
+        rows.append({"pid": pid, "ppid": ppid, "command": parts[2]})
+    return rows
+
+
+def wechat_webview_process_ids(rows: list[dict[str, Any]] | None = None) -> list[int]:
+    processes = rows if rows is not None else process_table()
+    roots = {
+        int(row["pid"])
+        for row in processes
+        if str(row.get("command") or "").split(" ", 1)[0] == WECHAT_WEBVIEW_EXECUTABLE
+    }
+    selected = set(roots)
+    while True:
+        children = {
+            int(row["pid"])
+            for row in processes
+            if int(row.get("ppid") or 0) in selected and int(row.get("pid") or 0) not in selected
+        }
+        if not children:
+            break
+        selected.update(children)
+    return sorted(selected)
+
+
+def reset_wechat_webview_process() -> dict[str, Any]:
+    if sys.platform != "darwin":
+        return {"ok": True, "supported": False, "found": False, "stopped_pids": []}
+    pids = wechat_webview_process_ids()
+    if not pids:
+        return {
+            "ok": True,
+            "supported": True,
+            "found": False,
+            "stopped_pids": [],
+            "message": "WeChat WebView was not running; the next article will start a fresh process.",
+        }
+    for pid in reversed(pids):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+    deadline = time.time() + 3
+    remaining = set(pids)
+    while remaining and time.time() < deadline:
+        remaining.intersection_update(wechat_webview_process_ids())
+        if remaining:
+            time.sleep(0.1)
+    for pid in remaining:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    kill_deadline = time.time() + 1
+    while remaining and time.time() < kill_deadline:
+        remaining.intersection_update(wechat_webview_process_ids())
+        if remaining:
+            time.sleep(0.05)
+    current_pids = wechat_webview_process_ids()
+    still_running = sorted(remaining)
+    return {
+        "ok": not still_running,
+        "supported": True,
+        "found": True,
+        "stopped_pids": [pid for pid in pids if pid not in still_running],
+        "remaining_pids": still_running,
+        "new_pids": [pid for pid in current_pids if pid not in pids],
+        "next_step": "Open a WeChat article; WeChat will create a fresh WebView process using the active proxy.",
+    }
+
+
+def proxy_enhancer_route_help(base: Path, port: int | None = None) -> dict[str, Any]:
     status = status_proxy_enhancer(base, port)
+    selected_port = status.get("port")
     apps = installed_proxy_apps()
     system_proxy = current_system_proxy_summary()
     v2ray_processes = process_matches(r"v2ray|sing-box|xray")
     clash_processes = process_matches(r"clash|mihomo|verge")
     return {
         "ok": True,
-        "goal": f"system/WeChat -> 127.0.0.1:{port} -> {status.get('upstream_proxy') or 'direct'} -> outside",
+        "goal": f"system/WeChat -> 127.0.0.1:{selected_port} -> {status.get('upstream_proxy') or 'direct'} -> outside" if selected_port else "no active proxy-enhancer session",
         "proxy_enhancer": {
             "running": bool(status.get("running")),
-            "proxy": f"127.0.0.1:{port}",
+            "proxy": f"127.0.0.1:{selected_port}" if selected_port else "",
             "upstream_proxy": status.get("upstream_proxy", ""),
             "system_proxy_points_here": bool(status.get("system_proxy_points_here")),
         },
@@ -2417,17 +2661,17 @@ def proxy_enhancer_route_help(base: Path, port: int = DEFAULT_PROXY_PORT) -> dic
             "clash_or_mihomo": clash_processes,
         },
         "recommended_path": (
-            f"Run proxy-enhancer-session-start --port {port} --upstream-proxy auto --yes. "
-            f"This routes system HTTP/HTTPS to 127.0.0.1:{port}; 23344 then chains to the detected upstream proxy or direct."
+            "Run proxy-enhancer-session-start --upstream-proxy auto --yes. "
+            "This allocates a random port and routes system HTTP/HTTPS through it."
         ),
-        "upstream_auto_rule": "Use current system proxy as upstream when it is not 23344; use saved previous proxy when system proxy is already 23344; otherwise direct.",
-        "stop_rule": f"Do not stop 127.0.0.1:{port} while the system proxy points to it. Use proxy-enhancer-session-finish --yes first, or proxy-enhancer-restart --yes for reloads.",
+        "upstream_auto_rule": "Resolve the upstream before changing system proxy settings, then preserve it for the full session.",
+        "stop_rule": "Use proxy-enhancer-session-finish --yes so the system proxy is restored before the random-port process stops.",
     }
 
 
 def start_proxy_enhancer_session(
     base: Path,
-    port: int = DEFAULT_PROXY_PORT,
+    port: int | None = None,
     upstream_proxy: str = "auto",
     yes: bool = False,
 ) -> dict[str, Any]:
@@ -2435,35 +2679,59 @@ def start_proxy_enhancer_session(
         return {
             "ok": False,
             "requires_confirmation": True,
-            "proxy": f"127.0.0.1:{port}",
-            "next_step": "Rerun with --yes to route system HTTP/HTTPS proxy to 23344. It will stay there until proxy-enhancer-session-finish is run.",
+            "port_range": [PROXY_PORT_MIN, PROXY_PORT_MAX],
+            "next_step": "Rerun with --yes to create a random-port enhancer session and route system HTTP/HTTPS through it.",
         }
-    start = start_proxy_enhancer(base, port, upstream_proxy)
+    normalize_saved_system_proxy_state(base)
+    existing_port = active_proxy_port(base)
+    if existing_port and system_proxy_points_to_port("", "127.0.0.1", existing_port):
+        status = status_proxy_enhancer(base, existing_port)
+        webview_reset = reset_wechat_webview_process()
+        return {
+            "ok": True,
+            "mode": "proxy-enhancer-session",
+            "already_active": True,
+            "port": existing_port,
+            "proxy": f"127.0.0.1:{existing_port}",
+            "upstream_proxy": status.get("upstream_proxy", ""),
+            "system_proxy_points_here": True,
+            "wechat_webview_reset": webview_reset,
+            "next_step": "Open or reload the WeChat article.",
+        }
+    if existing_port:
+        active = read_active_proxy_session(base)
+        old_pid = int(active.get("pid") or 0)
+        stop_proxy_process(old_pid, existing_port)
+        clear_active_proxy_session(base, old_pid)
+    try:
+        selected_port = choose_proxy_port(port)
+        resolved_upstream = resolve_upstream_proxy(upstream_proxy, selected_port, base)
+    except (RuntimeError, ValueError) as exc:
+        return {"ok": False, "stage": "preflight", "error": str(exc)}
+    start = start_proxy_enhancer(base, selected_port, resolved_upstream or "none")
     if not start.get("ok"):
         return {"ok": False, "stage": "proxy_enhancer_start", "proxy_enhancer": start}
-    already_enabled = system_proxy_points_to_port("", "127.0.0.1", port)
-    if already_enabled:
-        enable = {
-            "ok": True,
-            "already_enabled": True,
-            "proxy": f"127.0.0.1:{port}",
-            "message": "system proxy already points to proxy-enhancer",
-        }
-    else:
-        enable = enable_system_proxy(base, "", "127.0.0.1", port, True)
+    enable = enable_system_proxy(base, "", "127.0.0.1", selected_port, True)
     if not enable.get("ok"):
+        failed_pid = int(start.get("pid") or 0)
+        stop_proxy_process(failed_pid, selected_port)
+        clear_active_proxy_session(base, failed_pid)
         return {"ok": False, "stage": "system_proxy_enable", "proxy_enhancer": start, "enable": enable}
-    status = status_proxy_enhancer(base, port)
+    status = status_proxy_enhancer(base, selected_port)
+    webview_reset = reset_wechat_webview_process()
     return {
         "ok": True,
         "mode": "proxy-enhancer-session",
-        "proxy": f"127.0.0.1:{port}",
+        "port": selected_port,
+        "port_range": [PROXY_PORT_MIN, PROXY_PORT_MAX],
+        "proxy": f"127.0.0.1:{selected_port}",
         "upstream_proxy": start.get("upstream_proxy", ""),
         "system_proxy_points_here": bool(status.get("system_proxy_points_here")),
-        "proxy_already_enabled": already_enabled,
+        "proxy_already_enabled": False,
         "proxy_enhancer": start,
         "enable": enable,
-        "next_step": "Open or reload the WeChat article. The system proxy will stay on 23344 until you explicitly run proxy-enhancer-session-finish.",
+        "wechat_webview_reset": webview_reset,
+        "next_step": "Open or reload the WeChat article. Finish the session explicitly to restore system proxy and stop this random-port process.",
     }
 
 
@@ -2472,35 +2740,58 @@ def finish_proxy_enhancer_session(base: Path, yes: bool = False) -> dict[str, An
         return {
             "ok": False,
             "requires_confirmation": True,
-            "next_step": "Rerun with --yes to restore the saved system HTTP/HTTPS proxy. The 23344 proxy service will keep running.",
+            "next_step": "Rerun with --yes to restore system HTTP/HTTPS proxy and stop the active enhancer process.",
         }
+    active = read_active_proxy_session(base)
+    if active and str(active.get("mode") or "") not in {"", "proxy-enhancer"}:
+        return {"ok": False, "error": "active proxy session is not a proxy-enhancer session"}
+    try:
+        port = int(active.get("port") or 0)
+        pid = int(active.get("pid") or 0)
+    except (TypeError, ValueError):
+        port = 0
+        pid = 0
     restore = disable_system_proxy(base, yes=True)
+    stopped = stop_proxy_process(pid, port) if restore.get("ok") and port else False
+    state_path = Path(str(active.get("state") or "")) if active.get("state") else None
+    if state_path and state_path.exists():
+        state = read_json(state_path)
+        state["status"] = "stopped"
+        state["stopped_at"] = utc_now()
+        write_json(state_path, state)
+    if restore.get("ok"):
+        clear_active_proxy_session(base, pid)
     return {
         "ok": bool(restore.get("ok")),
         "mode": "proxy-enhancer-session",
+        "port": port or None,
         "restore": restore,
-        "proxy_service_kept_running": True,
-        "next_step": "System proxy restored. The 23344 local enhancer remains available.",
+        "proxy_process_stopped": stopped,
+        "next_step": "System proxy restored and the enhancer session stopped.",
     }
 
 
-def stop_proxy_service(base: Path, port: int = DEFAULT_PROXY_PORT, yes: bool = False) -> dict[str, Any]:
+def stop_proxy_service(base: Path, port: int | None = None, yes: bool = False) -> dict[str, Any]:
     ensure_runtime(base)
+    try:
+        selected_port = resolve_proxy_port(base, port, require_active=True)
+    except (RuntimeError, ValueError) as exc:
+        return {"ok": True, "stopped": False, "message": str(exc), "port": None}
     if not yes:
         return {
             "ok": False,
             "requires_confirmation": True,
-            "proxy": f"127.0.0.1:{port}",
+            "proxy": f"127.0.0.1:{selected_port}",
             "next_step": "Rerun with --yes to stop the local proxy service.",
         }
-    if system_proxy_points_to_port("", "127.0.0.1", port):
+    if system_proxy_points_to_port("", "127.0.0.1", selected_port):
         return {
             "ok": False,
             "requires_proxy_restore": True,
-            "proxy": f"127.0.0.1:{port}",
+            "proxy": f"127.0.0.1:{selected_port}",
             "next_step": "Restore system proxy before stopping the local proxy service.",
         }
-    running_state, running_state_path = running_history_proxy_on_port(base, port)
+    running_state, running_state_path = running_history_proxy_on_port(base, selected_port)
     if not running_state:
         state_path = proxy_service_state_path(base)
         if state_path.exists():
@@ -2508,34 +2799,42 @@ def stop_proxy_service(base: Path, port: int = DEFAULT_PROXY_PORT, yes: bool = F
             saved["status"] = "stopped"
             saved["stopped_at"] = utc_now()
             write_json(state_path, saved)
-        return {"ok": True, "stopped": False, "message": "proxy service is not running", "port": port}
+        return {"ok": True, "stopped": False, "message": "proxy service is not running", "port": selected_port}
     pid = int(running_state.get("pid") or 0)
-    stopped = stop_proxy_process(pid, port)
+    stopped = stop_proxy_process(pid, selected_port)
     running_state["status"] = "stopped"
     running_state["stopped_at"] = utc_now()
     if running_state_path:
         write_json(running_state_path, running_state)
     write_proxy_service_state(base, running_state)
-    return {"ok": True, "stopped": stopped, "pid": pid, "port": port, "state": str(proxy_service_state_path(base))}
+    active = read_active_proxy_session(base)
+    if int(active.get("pid") or 0) == pid:
+        clear_active_proxy_session(base, pid)
+    return {"ok": True, "stopped": stopped, "pid": pid, "port": selected_port, "state": str(proxy_service_state_path(base))}
 
 
 def restart_proxy_enhancer_safely(
     base: Path,
-    port: int = DEFAULT_PROXY_PORT,
+    port: int | None = None,
     upstream_proxy: str = "auto",
     yes: bool = False,
 ) -> dict[str, Any]:
     ensure_runtime(base)
+    normalize_saved_system_proxy_state(base)
+    try:
+        selected_port = resolve_proxy_port(base, port, require_active=True)
+    except (RuntimeError, ValueError) as exc:
+        return {"ok": False, "stage": "active_session", "error": str(exc)}
     if not yes:
         return {
             "ok": False,
             "requires_confirmation": True,
-            "proxy": f"127.0.0.1:{port}",
-            "next_step": "Rerun with --yes. If system proxy points to 23344, it will first be moved to the upstream proxy, then moved back.",
+            "proxy": f"127.0.0.1:{selected_port}",
+            "next_step": "Rerun with --yes. The active port and upstream will be preserved.",
         }
 
-    running_state, running_state_path = running_history_proxy_on_port(base, port)
-    pointed_here = system_proxy_points_to_port("", "127.0.0.1", port)
+    running_state, running_state_path = running_history_proxy_on_port(base, selected_port)
+    pointed_here = system_proxy_points_to_port("", "127.0.0.1", selected_port)
     service = choose_network_service("") if pointed_here else ""
     bypass: dict[str, Any] = {"applied": False}
 
@@ -2543,53 +2842,76 @@ def restart_proxy_enhancer_safely(
         endpoint = parse_proxy_endpoint(str((running_state or {}).get("upstream_proxy") or ""))
         if not endpoint:
             endpoint = saved_previous_proxy_endpoint(base)
-        if not endpoint:
-            return {
-                "ok": False,
-                "stage": "bypass",
-                "proxy": f"127.0.0.1:{port}",
-                "error": "cannot find an upstream proxy to keep network alive during restart",
-                "next_step": "Run proxy-enhancer-session-finish --yes first, or provide --upstream-proxy http://host:port.",
+        if endpoint:
+            bypass = {
+                "applied": True,
+                "reason": "system proxy pointed to the local enhancer",
+                "temporary_proxy": f"{endpoint[0]}:{endpoint[1]}",
+                "set": set_system_proxy_host_port(service, endpoint[0], endpoint[1]),
             }
-        bypass = {
-            "applied": True,
-            "reason": "system proxy pointed to the local enhancer",
-            "temporary_proxy": f"{endpoint[0]}:{endpoint[1]}",
-            "set": set_system_proxy_host_port(service, endpoint[0], endpoint[1]),
-        }
+        else:
+            bypass = {
+                "applied": True,
+                "reason": "active enhancer has no upstream; temporarily restore direct routing",
+                "temporary_proxy": "direct",
+                "restore": disable_system_proxy(base, yes=True),
+            }
 
     stopped = False
     old_pid = 0
     if running_state:
         old_pid = int(running_state.get("pid") or 0)
-        stopped = stop_proxy_process(old_pid, port)
+        stopped = stop_proxy_process(old_pid, selected_port)
         running_state["status"] = "stopped"
         running_state["stopped_at"] = utc_now()
         if running_state_path:
             write_json(running_state_path, running_state)
 
-    start = start_proxy_enhancer(base, port, upstream_proxy)
+    port_released = wait_for_proxy_port_available(selected_port)
+    if not port_released:
+        return {
+            "ok": False,
+            "mode": "proxy-enhancer",
+            "stage": "port_release",
+            "port": selected_port,
+            "old_pid": old_pid,
+            "stopped_old_process": stopped,
+            "bypass": bypass,
+            "system_proxy_points_here": False,
+            "next_step": "The old enhancer port did not become available; system proxy remains on the safe bypass route.",
+        }
+
+    preserved_upstream = str((running_state or {}).get("upstream_proxy") or "") if upstream_proxy == "auto" else upstream_proxy
+    start = start_proxy_enhancer(base, selected_port, preserved_upstream or "none")
     restored_to_enhancer: dict[str, Any] = {"applied": False}
     if start.get("ok") and pointed_here:
         restored_to_enhancer = {
             "applied": True,
-            "set": set_system_proxy_host_port(service, "127.0.0.1", port),
+            "set": set_system_proxy_host_port(service, "127.0.0.1", selected_port),
         }
+    webview_reset = reset_wechat_webview_process() if start.get("ok") and pointed_here else {
+        "ok": True,
+        "supported": sys.platform == "darwin",
+        "found": False,
+        "stopped_pids": [],
+        "message": "WebView reset skipped because the system proxy was not routed through the enhancer.",
+    }
 
     return {
         "ok": bool(start.get("ok")),
         "mode": "proxy-enhancer",
-        "port": port,
+        "port": selected_port,
         "old_pid": old_pid,
         "stopped_old_process": stopped,
         "bypass": bypass,
         "start": start,
         "restored_to_enhancer": restored_to_enhancer,
-        "system_proxy_points_here": system_proxy_points_to_port("", "127.0.0.1", port),
+        "wechat_webview_reset": webview_reset,
+        "system_proxy_points_here": system_proxy_points_to_port("", "127.0.0.1", selected_port),
         "next_step": (
             "Reload the WeChat article; the new enhancer code is active."
             if start.get("ok")
-            else "The system proxy was left on the temporary upstream instead of a dead 23344 port."
+            else "The system proxy was left on the temporary upstream instead of a dead enhancer port."
         ),
     }
 
@@ -2636,17 +2958,47 @@ def parse_networksetup_proxy(output: str) -> dict[str, Any]:
         parsed[normalized] = value.strip()
     enabled = str(parsed.get("enabled", "")).lower()
     parsed["enabled_bool"] = enabled in {"yes", "on", "1", "true"}
+    if not parsed["enabled_bool"]:
+        parsed["server"] = ""
+        parsed["port"] = ""
     return parsed
+
+
+def normalize_network_proxy_state(state: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(state)
+    for key in ("web", "secure_web"):
+        item = dict(normalized.get(key) or {})
+        if not item.get("enabled_bool"):
+            item["server"] = ""
+            item["port"] = ""
+        normalized[key] = item
+    return normalized
+
+
+def normalize_saved_system_proxy_state(base: Path) -> dict[str, Any]:
+    state_path = system_proxy_state_path(base)
+    if not state_path.exists():
+        return {"ok": True, "changed": False, "state": str(state_path)}
+    saved = read_json(state_path)
+    if not isinstance(saved, dict):
+        return {"ok": False, "changed": False, "state": str(state_path), "error": "invalid proxy state"}
+    previous = saved.get("previous") if isinstance(saved.get("previous"), dict) else {}
+    normalized = normalize_network_proxy_state(previous)
+    changed = normalized != previous
+    if changed:
+        saved["previous"] = normalized
+        write_json(state_path, saved)
+    return {"ok": True, "changed": changed, "state": str(state_path)}
 
 
 def get_network_proxy_state(service: str) -> dict[str, Any]:
     web = parse_networksetup_proxy(run_networksetup(["-getwebproxy", service]).stdout)
     secure = parse_networksetup_proxy(run_networksetup(["-getsecurewebproxy", service]).stdout)
-    return {
+    return normalize_network_proxy_state({
         "service": service,
         "web": web,
         "secure_web": secure,
-    }
+    })
 
 
 def set_proxy_from_state(service: str, kind: str, state: dict[str, Any]) -> None:
@@ -2743,7 +3095,7 @@ def enable_system_proxy(base: Path, service: str, host: str, port: int, yes: boo
             "next_step": "Rerun with --yes to modify macOS HTTP/HTTPS proxy settings and save the previous state.",
         }
     state_path = system_proxy_state_path(base)
-    previous = get_network_proxy_state(selected)
+    previous = normalize_network_proxy_state(get_network_proxy_state(selected))
     payload = {
         "saved_at": utc_now(),
         "service": selected,
@@ -2779,6 +3131,8 @@ def disable_system_proxy(base: Path, service: str = "", yes: bool = False) -> di
         run_networksetup(["-setsecurewebproxystate", selected, "off"])
         return {"ok": True, "service": selected, "restored": False, "message": "proxy disabled; no saved state was available"}
     saved = read_json(state_path)
+    previous = saved.get("previous") if isinstance(saved.get("previous"), dict) else {}
+    saved["previous"] = normalize_network_proxy_state(previous)
     selected = service or str(saved.get("service") or "")
     if not selected:
         selected = choose_network_service("")
@@ -2790,7 +3144,7 @@ def disable_system_proxy(base: Path, service: str = "", yes: bool = False) -> di
             "state": str(state_path),
             "next_step": "Rerun with --yes to restore saved HTTP/HTTPS proxy settings.",
         }
-    previous = saved.get("previous") if isinstance(saved.get("previous"), dict) else {}
+    previous = saved["previous"]
     web = previous.get("web") if isinstance(previous.get("web"), dict) else {}
     secure = previous.get("secure_web") if isinstance(previous.get("secure_web"), dict) else {}
     set_proxy_from_state(selected, "web", web)
@@ -3662,7 +4016,7 @@ def command_snapshot_latest(args: argparse.Namespace) -> int:
         "ok": bool(latest),
         "mode": "proxy-enhancer",
         "snapshot": latest,
-        "next_step": "Open an article through the enhancer and click 保存这篇." if not latest else "Use snapshot-extract latest to create structured files.",
+        "next_step": "Open an article through the enhancer and click 收藏到本地." if not latest else "Use snapshot-extract latest to create structured files.",
     }
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if latest else 3
@@ -3931,12 +4285,12 @@ def prepare_proxy_snapshot(
         "proxy": f"127.0.0.1:{port}",
         "upstream_proxy": proxy.get("upstream_proxy", ""),
         "proxy_already_enabled": proxy_already_enabled,
-        "next_step": "Open article_url in the WeChat desktop built-in browser, wait until comments/metrics finish loading if needed, click 保存当前页面, then run proxy-snapshot-finish.",
+        "next_step": "Open article_url in the WeChat desktop built-in browser, wait until comments/metrics finish loading if needed, click 收藏到本地, then run proxy-snapshot-finish.",
         "wechat_step": [
             "Send article_url to WeChat File Transfer.",
             "Open it with the WeChat desktop built-in browser.",
             "Wait for the article, comments, and bottom interaction area to load.",
-            "Click the injected 保存当前页面 button.",
+            "Click the injected 收藏到本地 button.",
             "Reply when finished so the Skill can run proxy-snapshot-finish.",
         ],
         "files": {
@@ -3975,7 +4329,7 @@ def proxy_snapshot_status(base: Path, session_id: str) -> dict[str, Any]:
         "next_step": (
             "Run proxy-snapshot-finish to restore the system proxy."
             if marker.get("ready")
-            else "Open the article in WeChat built-in browser and click 保存当前页面."
+            else "Open the article in WeChat built-in browser and click 收藏到本地."
         ),
     }
 
@@ -4359,7 +4713,7 @@ def extract_auto_snapshot(base: Path, snapshot_id: str = "latest", output_dir: s
             "",
             "## 边界",
             "",
-            "- 评论只包含点击保存这篇时页面已加载的内容。",
+            "- 评论只包含点击收藏到本地时页面已加载的内容。",
             "- 图片默认只提取 URL，不在 extract 阶段下载。",
             "- 互动数据只来自页面 DOM/文本可观察结果，缺失字段不推断。",
             "",
@@ -4653,7 +5007,7 @@ def render_page_data_markdown(
         "",
         f"- 保存时间：{attached_at or 'missing'}",
         f"- 快照 ID：{meta.get('snapshot_id') or 'missing'}",
-        "- 数据边界：只包含点击“保存这篇”时页面已经加载和暴露的内容；页面没暴露的数据标记为 `missing`。",
+        "- 数据边界：只包含点击“收藏到本地”时页面已经加载和暴露的内容；页面没暴露的数据标记为 `missing`。",
         "",
         "### 互动数据",
         "",
@@ -5309,9 +5663,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--stop-proxy", action="store_true", help="Also stop the local proxy process")
     p.set_defaults(func=command_proxy_snapshot_finish)
 
-    p = sub.add_parser("proxy-enhancer-start", help="Start persistent WeChat article enhancer proxy without changing system proxy")
+    p = sub.add_parser("proxy-enhancer-start", help="Start a random-port WeChat article enhancer without changing system proxy")
     p.add_argument("--runtime-dir", default=argparse.SUPPRESS, help="Override runtime directory")
-    p.add_argument("--port", type=int, default=DEFAULT_PROXY_PORT)
+    p.add_argument("--port", type=int, default=None, help=f"Optional fixed port for debugging; default selects a free port in {PROXY_PORT_MIN}-{PROXY_PORT_MAX}")
     p.add_argument(
         "--upstream-proxy",
         default="auto",
@@ -5319,20 +5673,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.set_defaults(func=command_proxy_enhancer_start)
 
-    p = sub.add_parser("proxy-enhancer-status", help="Check persistent WeChat article enhancer proxy")
+    p = sub.add_parser("proxy-enhancer-status", help="Check the active WeChat article enhancer session")
     p.add_argument("--runtime-dir", default=argparse.SUPPRESS, help="Override runtime directory")
-    p.add_argument("--port", type=int, default=DEFAULT_PROXY_PORT)
+    p.add_argument("--port", type=int, default=None, help="Optional override; default reads the active enhancer session")
     p.set_defaults(func=command_proxy_enhancer_status)
 
-    p = sub.add_parser("proxy-enhancer-stop", help="Stop persistent WeChat article enhancer proxy")
+    p = sub.add_parser("proxy-enhancer-stop", help="Stop the active WeChat article enhancer process")
     p.add_argument("--runtime-dir", default=argparse.SUPPRESS, help="Override runtime directory")
-    p.add_argument("--port", type=int, default=DEFAULT_PROXY_PORT)
+    p.add_argument("--port", type=int, default=None, help="Optional override; default reads the active enhancer session")
     p.add_argument("--yes", action="store_true", help="Actually stop the local proxy service")
     p.set_defaults(func=command_proxy_enhancer_stop)
 
     p = sub.add_parser("proxy-enhancer-restart", help="Safely restart enhancer without leaving system proxy on a dead port")
     p.add_argument("--runtime-dir", default=argparse.SUPPRESS, help="Override runtime directory")
-    p.add_argument("--port", type=int, default=DEFAULT_PROXY_PORT)
+    p.add_argument("--port", type=int, default=None, help="Optional override; default preserves the active enhancer port")
     p.add_argument(
         "--upstream-proxy",
         default="auto",
@@ -5341,9 +5695,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--yes", action="store_true", help="Actually restart the local proxy service")
     p.set_defaults(func=command_proxy_enhancer_restart)
 
-    p = sub.add_parser("proxy-enhancer-check-ingress", help="Check whether WeChat article traffic reached 23344")
+    p = sub.add_parser("proxy-enhancer-check-ingress", help="Check whether WeChat article traffic reached the active enhancer")
     p.add_argument("--runtime-dir", default=argparse.SUPPRESS, help="Override runtime directory")
-    p.add_argument("--port", type=int, default=DEFAULT_PROXY_PORT)
+    p.add_argument("--port", type=int, default=None, help="Optional override; default reads the active enhancer session")
     p.add_argument("--minutes", type=int, default=10, help="Recent window to inspect")
     p.set_defaults(func=command_proxy_enhancer_check_ingress)
 
@@ -5353,14 +5707,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=80, help="Maximum events to print")
     p.set_defaults(func=command_proxy_enhancer_logs)
 
-    p = sub.add_parser("proxy-enhancer-route-help", help="Show local routing facts for WeChat -> 23344 -> upstream")
+    p = sub.add_parser("proxy-enhancer-route-help", help="Show routing facts for the active random-port enhancer")
     p.add_argument("--runtime-dir", default=argparse.SUPPRESS, help="Override runtime directory")
-    p.add_argument("--port", type=int, default=DEFAULT_PROXY_PORT)
+    p.add_argument("--port", type=int, default=None, help="Optional override; default reads the active enhancer session")
     p.set_defaults(func=command_proxy_enhancer_route_help)
 
-    p = sub.add_parser("proxy-enhancer-session-start", help="Route system HTTP/HTTPS proxy to the persistent enhancer")
+    p = sub.add_parser("proxy-enhancer-session-start", help="Create a random-port enhancer session and route system HTTP/HTTPS through it")
     p.add_argument("--runtime-dir", default=argparse.SUPPRESS, help="Override runtime directory")
-    p.add_argument("--port", type=int, default=DEFAULT_PROXY_PORT)
+    p.add_argument("--port", type=int, default=None, help=f"Optional fixed port for debugging; default selects a free port in {PROXY_PORT_MIN}-{PROXY_PORT_MAX}")
     p.add_argument(
         "--upstream-proxy",
         default="auto",
