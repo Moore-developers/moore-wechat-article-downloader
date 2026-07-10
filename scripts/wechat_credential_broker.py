@@ -314,7 +314,10 @@ class WeChatCredentialBroker:
             def redirect_request(self, req: Any, fp: Any, code: int, msg: str, hdrs: Any, newurl: str) -> None:
                 return None
 
-        opener = urllib.request.build_opener(NoRedirect())
+        # The broker runs inside mitmdump. Do not inherit the macOS system
+        # proxy here, otherwise its own requests are re-intercepted and Python
+        # rejects mitmproxy's local CA before reaching WeChat.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
         with opener.open(request, timeout=12) as response:
             charset = response.headers.get_content_charset() or "utf-8"
             body = response.read(1024 * 1024 + 1)
