@@ -9,6 +9,7 @@ queue or resume an engagement run.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -26,6 +27,19 @@ BROKER_TTL_SECONDS = 25 * 60
 MAX_REQUEST_BYTES = 2 * 1024 * 1024
 REQUIRED_FIELDS = ("uin", "key", "pass_ticket", "appmsg_token", "cookie")
 METRIC_FIELDS = ("read_count", "like_count", "old_like_count", "share_count", "comment_count")
+MAX_ARTICLES_PER_REQUEST = 10
+MAX_COMMENT_PAGES = 3
+MAX_COMMENT_ROWS_PER_ARTICLE = 300
+
+
+def credential_socket_path(base: Path, session_id: str) -> Path:
+    """Keep the Unix socket below the platform path-length limit."""
+    seed = f"{Path(base).expanduser().resolve()}|{session_id}".encode("utf-8")
+    return Path("/tmp") / f"moore-wechat-{hashlib.sha256(seed).hexdigest()[:24]}.sock"
+
+
+def credential_capability_path(base: Path, session_id: str) -> Path:
+    return Path(base).expanduser() / "context" / f"{session_id}.credential-capability"
 
 
 def utc_now() -> str:
@@ -39,11 +53,13 @@ class WeChatCredentialBroker:
         self,
         socket_path: Path,
         session_id: str,
+        capability: str,
         ttl_seconds: int = BROKER_TTL_SECONDS,
         http_get: Callable[[str, dict[str, str]], str] | None = None,
     ) -> None:
         self.socket_path = Path(socket_path)
         self.session_id = session_id
+        self.capability = capability
         self.ttl_seconds = max(60, int(ttl_seconds))
         self._credentials: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
@@ -137,7 +153,7 @@ class WeChatCredentialBroker:
         raw = self._credential_for(biz)
         if raw is None:
             return {"ok": False, "status": "waiting_credential", "error": "valid credential is unavailable", "articles": []}
-        selected = [item for item in articles if isinstance(item, dict)][:100]
+        selected = [item for item in articles if isinstance(item, dict)][:MAX_ARTICLES_PER_REQUEST]
         with ThreadPoolExecutor(max_workers=2) as executor:
             futures = [executor.submit(self._fetch_article_engagement, biz, raw, article) for article in selected]
             results = [future.result() for future in as_completed(futures)]
@@ -162,9 +178,13 @@ class WeChatCredentialBroker:
         msgid = str(article.get("msgid") or "")
         comment_id = str(article.get("comment_id") or "")
         url = str(article.get("url") or "")
-        if not article_id or not msgid or not comment_id or not url:
+        if not article_id or not msgid or not comment_id or not self._allowed_article_url(url):
             return {"ok": False, "article_id": article_id, "error": "article context is incomplete"}
-        headers = {"Cookie": raw["cookie"], "User-Agent": "Mozilla/5.0 MicroMessenger"}
+        headers = {
+            "Cookie": raw["cookie"],
+            "Referer": "https://mp.weixin.qq.com/",
+            "User-Agent": "Mozilla/5.0 MicroMessenger",
+        }
         try:
             article_html = self._http_get(self._with_credential_query(url, biz, raw), headers)
             metrics = self._extract_metrics(article_html)
@@ -202,12 +222,14 @@ class WeChatCredentialBroker:
         seen: set[str] = set()
         buffer = ""
         complete = True
-        for _page in range(10):
+        for _page in range(MAX_COMMENT_PAGES):
             request_params = dict(params)
             if buffer:
                 request_params["buffer"] = buffer
             text = self._http_get("https://mp.weixin.qq.com/mp/appmsg_comment?" + urllib.parse.urlencode(request_params), headers)
             payload = json.loads(text)
+            if not isinstance(payload, dict) or int((payload.get("base_resp") or {}).get("ret") or 0) != 0:
+                raise RuntimeError("comment endpoint rejected request")
             rows = payload.get("elected_comment") if isinstance(payload, dict) else []
             if not isinstance(rows, list):
                 rows = []
@@ -229,10 +251,14 @@ class WeChatCredentialBroker:
                 if identity:
                     seen.add(identity)
                 comments.append(normalized)
+                if len(comments) >= MAX_COMMENT_ROWS_PER_ARTICLE:
+                    return comments, False
             continue_flag = int(payload.get("continue_flag") or 0) if isinstance(payload, dict) else 0
             buffer = str(payload.get("buffer") or "") if isinstance(payload, dict) else ""
-            if not continue_flag or not buffer:
+            if not continue_flag:
                 return comments, complete
+            if not buffer:
+                return comments, False
         return comments, False
 
     @staticmethod
@@ -243,6 +269,13 @@ class WeChatCredentialBroker:
         for key in ("uin", "key", "pass_ticket", "appmsg_token"):
             query[key] = [raw[key]]
         return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urllib.parse.urlencode(query, doseq=True), ""))
+
+    @staticmethod
+    def _allowed_article_url(url: str) -> bool:
+        parsed = urllib.parse.urlsplit(url)
+        return parsed.scheme == "https" and parsed.hostname == "mp.weixin.qq.com" and (
+            parsed.path == "/s" or parsed.path.startswith("/s/") or parsed.path == "/mp/appmsg/show"
+        )
 
     @staticmethod
     def _extract_metrics(html_text: str) -> dict[str, int | None]:
@@ -265,9 +298,17 @@ class WeChatCredentialBroker:
     @staticmethod
     def _default_http_get(url: str, headers: dict[str, str]) -> str:
         request = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(request, timeout=20) as response:
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req: Any, fp: Any, code: int, msg: str, hdrs: Any, newurl: str) -> None:
+                return None
+
+        opener = urllib.request.build_opener(NoRedirect())
+        with opener.open(request, timeout=12) as response:
             charset = response.headers.get_content_charset() or "utf-8"
-            return response.read().decode(charset, errors="replace")
+            body = response.read(1024 * 1024 + 1)
+            if len(body) > 1024 * 1024:
+                raise RuntimeError("wechat response exceeds local safety limit")
+            return body.decode(charset, errors="replace")
 
     @staticmethod
     def _header_value(headers: Any, name: str) -> str:
@@ -303,7 +344,10 @@ class WeChatCredentialBroker:
                     elif request.get("op") == "status":
                         response = self.status(str(request.get("biz") or ""))
                     elif request.get("op") == "fetch_engagement":
-                        response = self.fetch_engagement(str(request.get("biz") or ""), request.get("articles") or [])
+                        if not self.capability or str(request.get("capability") or "") != self.capability:
+                            response = {"ok": False, "error": "broker authorization failed"}
+                        else:
+                            response = self.fetch_engagement(str(request.get("biz") or ""), request.get("articles") or [])
                     else:
                         response = {"ok": False, "error": "unsupported operation"}
                 except Exception:

@@ -21,7 +21,7 @@ import urllib.parse
 from pathlib import Path
 from typing import Any
 
-from wechat_credential_broker import WeChatCredentialBroker
+from wechat_credential_broker import WeChatCredentialBroker, credential_socket_path
 
 
 HISTORY_FIELDS = [
@@ -1049,8 +1049,12 @@ class WeChatHistoryCapture:
         if context["session"].get("mode") != "proxy-enhancer":
             return None
         if self.credential_broker is None:
-            socket_path = self.base / "context" / f"{context['session_id']}.credential.sock"
-            broker = WeChatCredentialBroker(socket_path, str(context["session_id"]))
+            socket_path = credential_socket_path(self.base, str(context["session_id"]))
+            broker = WeChatCredentialBroker(
+                socket_path,
+                str(context["session_id"]),
+                os.environ.get("MOORE_WECHAT_BROKER_CAPABILITY", ""),
+            )
             broker.start()
             self.credential_broker = broker
         return self.credential_broker
@@ -1058,7 +1062,10 @@ class WeChatHistoryCapture:
     def capture_credential(self, flow: Any, context: dict[str, Any]) -> None:
         request = flow.request
         content_type = flow.response.headers.get("content-type", "") if flow.response else ""
-        if not is_article_page(request.host, request.path, content_type):
+        if request.host != "mp.weixin.qq.com" or (
+            not is_article_page(request.host, request.path, content_type)
+            and request.path.split("?", 1)[0] != "/mp/appmsg_comment"
+        ):
             return
         broker = self.ensure_credential_broker(context)
         if broker:

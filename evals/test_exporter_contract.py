@@ -556,12 +556,16 @@ class ExporterContractTests(unittest.TestCase):
         context_dir = self.tmp / "context"
         context_dir.mkdir(parents=True, exist_ok=True)
         (context_dir / "active-proxy-session.json").write_text(json.dumps({"session_id": "proxy-enhancer-test"}), encoding="utf-8")
+        capability_path = wechat_exporter.credential_capability_path(self.tmp, "proxy-enhancer-test")
+        capability_path.write_text("capability-test\n", encoding="utf-8")
         original = wechat_exporter.broker_request
 
         def fake_broker_request(socket_path: Path, payload: dict, timeout_seconds: float) -> dict:
-            self.assertEqual(socket_path.name, "proxy-enhancer-test.credential.sock")
+            self.assertTrue(socket_path.name.startswith("moore-wechat-"))
+            self.assertTrue(socket_path.name.endswith(".sock"))
             self.assertEqual(payload["op"], "fetch_engagement")
             self.assertEqual(payload["biz"], "biz-sync")
+            self.assertEqual(payload["capability"], "capability-test")
             return {
                 "ok": True,
                 "status": "complete",

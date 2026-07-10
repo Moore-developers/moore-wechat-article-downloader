@@ -28,6 +28,7 @@ import subprocess
 import sys
 import tempfile
 import random
+import secrets
 import threading
 import time
 import urllib.error
@@ -37,7 +38,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-from wechat_credential_broker import broker_status
+from wechat_credential_broker import broker_status, credential_capability_path, credential_socket_path
 
 
 APP_DIR = Path.home() / ".moore" / "wechat-article-downloader"
@@ -2068,11 +2069,17 @@ def start_history_proxy(base: Path, session: dict[str, Any], port: int, limit: i
         return {"ok": False, "error": f"missing mitm addon: {addon}"}
     log_path = session_proxy_log_path(base, session["session_id"])
     env = os.environ.copy()
+    broker_capability = secrets.token_urlsafe(32)
+    capability_path = credential_capability_path(base, str(session["session_id"]))
+    capability_path.parent.mkdir(parents=True, exist_ok=True)
+    capability_path.write_text(broker_capability + "\n", encoding="utf-8")
+    os.chmod(capability_path, 0o600)
     env.update(
         {
             "MOORE_WECHAT_RUNTIME_DIR": str(base),
             "MOORE_WECHAT_SESSION_ID": str(session["session_id"]),
             "MOORE_WECHAT_HISTORY_LIMIT": str(max(limit, 1)),
+            "MOORE_WECHAT_BROKER_CAPABILITY": broker_capability,
         }
     )
     log_fh = log_path.open("a", encoding="utf-8")
@@ -2415,7 +2422,7 @@ def status_proxy_enhancer(base: Path, port: int | None = None) -> dict[str, Any]
     status = status_proxy_service(base, selected_port)
     active = read_active_proxy_session(base)
     session_id = str(active.get("session_id") or "")
-    credential_status = broker_status(base / "context" / f"{session_id}.credential.sock") if session_id else {
+    credential_status = broker_status(credential_socket_path(base, session_id)) if session_id else {
         "ok": False,
         "status": "unavailable",
         "error": "no active collection session",

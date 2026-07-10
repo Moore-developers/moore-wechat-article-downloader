@@ -51,7 +51,7 @@ from wechat_downloader import (  # noqa: E402
     scrub_payload,
     utc_now,
 )
-from wechat_credential_broker import broker_request  # noqa: E402
+from wechat_credential_broker import broker_request, credential_capability_path, credential_socket_path  # noqa: E402
 
 
 DEFAULT_BASE_URL = "https://down.mptext.top"
@@ -2168,7 +2168,7 @@ def ready_engagement_contexts(base: Path, account_id: int, limit: int) -> list[d
         db.close()
 
 
-def active_collection_socket(base: Path) -> Path | None:
+def active_collection_broker(base: Path) -> tuple[Path, str] | None:
     active_path = base / "context" / "active-proxy-session.json"
     if not active_path.exists():
         return None
@@ -2177,7 +2177,14 @@ def active_collection_socket(base: Path) -> Path | None:
     except Exception:
         return None
     session_id = str(active.get("session_id") or "").strip() if isinstance(active, dict) else ""
-    return base / "context" / f"{session_id}.credential.sock" if session_id else None
+    if not session_id:
+        return None
+    capability_path = credential_capability_path(base, session_id)
+    try:
+        capability = capability_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return credential_socket_path(base, session_id), capability
 
 
 def sync_engagement(base: Path, account_id: int, limit: int = 50) -> dict[str, Any]:
@@ -2204,12 +2211,12 @@ def sync_engagement(base: Path, account_id: int, limit: int = 50) -> dict[str, A
         db.commit()
     finally:
         db.close()
-    socket_path = active_collection_socket(base)
+    broker = active_collection_broker(base)
     payload = broker_request(
-        socket_path,
-        {"op": "fetch_engagement", "biz": biz, "articles": contexts},
+        broker[0],
+        {"op": "fetch_engagement", "biz": biz, "articles": contexts, "capability": broker[1]},
         timeout_seconds=600,
-    ) if socket_path else {"ok": False, "status": "unavailable", "error": "credential broker is not running"}
+    ) if broker else {"ok": False, "status": "unavailable", "error": "credential broker is not running"}
     if payload.get("status") in {"waiting_credential", "unavailable"} or not payload.get("articles"):
         error = str(payload.get("error") or "valid credential is unavailable")
         db = connect_db(base)

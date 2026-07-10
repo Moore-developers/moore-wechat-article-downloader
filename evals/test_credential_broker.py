@@ -12,7 +12,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
-from wechat_credential_broker import WeChatCredentialBroker, broker_status  # noqa: E402
+from wechat_credential_broker import WeChatCredentialBroker, broker_status, credential_socket_path  # noqa: E402
 
 
 class CredentialBrokerTests(unittest.TestCase):
@@ -24,7 +24,7 @@ class CredentialBrokerTests(unittest.TestCase):
 
     def test_status_is_redacted_and_socket_is_owner_only(self) -> None:
         path = self.tmp / "credential.sock"
-        broker = WeChatCredentialBroker(path, "proxy-enhancer-test")
+        broker = WeChatCredentialBroker(path, "proxy-enhancer-test", "capability-test")
         broker.start()
         try:
             captured = broker.capture(
@@ -46,7 +46,7 @@ class CredentialBrokerTests(unittest.TestCase):
         self.assertEqual(path.exists(), False)
 
     def test_expired_credential_is_removed(self) -> None:
-        broker = WeChatCredentialBroker(self.tmp / "expired.sock", "session", ttl_seconds=60)
+        broker = WeChatCredentialBroker(self.tmp / "expired.sock", "session", "capability-test", ttl_seconds=60)
         broker.capture("https://mp.weixin.qq.com/s/demo?__biz=MzDemo&uin=12", {"cookie": "x"})
         broker._credentials["MzDemo"]["expires_at_epoch"] = 0
         self.assertEqual(broker.status()["credentials"], [])
@@ -60,7 +60,7 @@ class CredentialBrokerTests(unittest.TestCase):
                 return '{"elected_comment":[{"id":"c1","nick_name":"读者","content":"有价值","like_num":3}],"continue_flag":0}'
             return "var appmsg_read_num = '12'; var appmsg_like_num = '3'; var comment_count = '1';"
 
-        broker = WeChatCredentialBroker(self.tmp / "engagement.sock", "session", http_get=fake_get)
+        broker = WeChatCredentialBroker(self.tmp / "engagement.sock", "session", "capability-test", http_get=fake_get)
         broker.capture(
             "https://mp.weixin.qq.com/s/demo?__biz=MzDemo&uin=12&key=key-secret&pass_ticket=ticket-secret&appmsg_token=token-secret",
             {"cookie": "wap_sid2=cookie-secret"},
@@ -79,6 +79,42 @@ class CredentialBrokerTests(unittest.TestCase):
         for value in ("key-secret", "ticket-secret", "token-secret", "cookie-secret"):
             self.assertNotIn(value, serialized)
         self.assertEqual(len(calls), 2)
+
+    def test_rejects_non_wechat_url_and_comment_api_error(self) -> None:
+        calls: list[str] = []
+
+        def fake_get(url: str, _headers: dict[str, str]) -> str:
+            calls.append(url)
+            if "/mp/appmsg_comment" in url:
+                return '{"base_resp":{"ret":-1},"elected_comment":[],"continue_flag":0}'
+            return "var appmsg_read_num = '12';"
+
+        broker = WeChatCredentialBroker(self.tmp / "safe.sock", "session", "capability-test", http_get=fake_get)
+        broker.capture(
+            "https://mp.weixin.qq.com/s/demo?__biz=MzDemo&uin=12&key=key-secret&pass_ticket=ticket-secret&appmsg_token=token-secret",
+            {"cookie": "wap_sid2=cookie-secret"},
+        )
+        invalid = broker.fetch_engagement(
+            "MzDemo", [{"article_id": 1, "msgid": "m", "idx": 1, "comment_id": "c", "url": "https://example.com/collect"}]
+        )
+        rejected = broker.fetch_engagement(
+            "MzDemo", [{"article_id": 2, "msgid": "m", "idx": 1, "comment_id": "c", "url": "https://mp.weixin.qq.com/s/demo"}]
+        )
+
+        self.assertFalse(invalid["articles"][0]["ok"])
+        self.assertFalse(rejected["articles"][0]["ok"])
+        self.assertEqual(len(calls), 2)
+
+    def test_short_socket_path_supports_long_runtime_directory(self) -> None:
+        long_base = self.tmp / ("nested-" * 25)
+        path = credential_socket_path(long_base, "proxy-enhancer-" + "x" * 48)
+        self.assertLess(len(str(path).encode("utf-8")), 100)
+        broker = WeChatCredentialBroker(path, "session", "capability-test")
+        broker.start()
+        try:
+            self.assertTrue(path.exists())
+        finally:
+            broker.close()
 
 
 if __name__ == "__main__":
