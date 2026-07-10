@@ -418,12 +418,13 @@ class WizardContractTests(unittest.TestCase):
         self.assertEqual(payload["state"], "done")
         self.assertEqual(payload["success_count"], 1)
         self.assertEqual(payload["failure_count"], 0)
-        self.assertTrue((output_dir / "index.csv").exists())
-        self.assertTrue((output_dir / "articles.json").exists())
-        self.assertTrue((output_dir / "errors.json").exists())
-        run_json = json.loads((output_dir / "run.json").read_text(encoding="utf-8"))
+        actual_output_dir = Path(payload["output_dir"])
+        self.assertTrue((actual_output_dir / "index.csv").exists())
+        self.assertTrue((actual_output_dir / "articles.json").exists())
+        self.assertTrue((actual_output_dir / "errors.json").exists())
+        run_json = json.loads(Path(payload["run_json"]).read_text(encoding="utf-8"))
         self.assertEqual(run_json["success_count"], 1)
-        markdown_files = sorted((output_dir / "articles").glob("*.md"))
+        markdown_files = sorted((actual_output_dir / "articles").glob("*.md"))
         self.assertEqual(len(markdown_files), 1)
         markdown = markdown_files[0].read_text(encoding="utf-8")
         self.assertIn("离线 fixture 文章正文", markdown)
@@ -442,8 +443,9 @@ class WizardContractTests(unittest.TestCase):
 
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["success_count"], 2)
-        self.assertEqual(len(list((output_dir / "articles").glob("*.md"))), 2)
-        articles = json.loads((output_dir / "articles.json").read_text(encoding="utf-8"))
+        actual_output_dir = Path(payload["output_dir"])
+        self.assertEqual(len(list((actual_output_dir / "articles").glob("*.md"))), 2)
+        articles = json.loads(Path(payload["articles_json"]).read_text(encoding="utf-8"))
         self.assertEqual([item["title"] for item in articles], ["离线单篇下载测试", "离线多篇下载测试"])
         db = sqlite3.connect(self.tmp / "wizard.sqlite")
         try:
@@ -539,7 +541,7 @@ class WizardContractTests(unittest.TestCase):
         original = wechat_downloader.download_one_markdown_only
         attempts: dict[str, int] = {}
 
-        def fake_download(url: str, output_dir: Path, seq: str, download_assets: bool) -> dict:
+        def fake_download(url: str, output_dir: Path, seq: str, download_assets: bool, filename_stem: str = "") -> dict:
             attempts[url] = attempts.get(url, 0) + 1
             if url.endswith("/b") and attempts[url] == 1:
                 raise RuntimeError("temporary network failure")
@@ -1075,25 +1077,26 @@ class WizardContractTests(unittest.TestCase):
     def test_url_mode_skips_already_downloaded_for_same_task(self) -> None:
         task_id = "task_skip"
         url = "https://mp.weixin.qq.com/s/already"
+        previous_dir = self.tmp / "previous"
+        previous_article = previous_dir / "articles" / "previous.md"
+        previous_article.parent.mkdir(parents=True, exist_ok=True)
+        previous_article.write_text("already here\n", encoding="utf-8")
         wechat_wizard.record_download_manifest(
             self.tmp,
             task_id,
             "url",
             {
                 "run_id": "run_previous",
-                "output_dir": str(self.tmp / "previous"),
+                "output_dir": str(previous_dir),
                 "success_count": 1,
                 "failure_count": 0,
-                "articles": [{"source_url": url, "status": "success"}],
+                "articles": [{"source_url": url, "status": "success", "markdown_path": "articles/previous.md"}],
                 "failed": [],
             },
             "done",
         )
         intent = wechat_wizard.parse_intent(f"下载：{url}")
         wechat_wizard.decide_mode(intent)
-        existing_article = self.tmp / "out" / "articles" / "previous.md"
-        existing_article.parent.mkdir(parents=True, exist_ok=True)
-        existing_article.write_text("already here\n", encoding="utf-8")
 
         result = wechat_wizard.run_url_mode(self.tmp, task_id, intent, str(self.tmp / "out"), False, False)
 
@@ -1101,7 +1104,7 @@ class WizardContractTests(unittest.TestCase):
         self.assertEqual(result["state"], "done")
         self.assertEqual(result["success_count"], 0)
         self.assertEqual(result["skipped_count"], 1)
-        run_json = json.loads((self.tmp / "out" / "run.json").read_text(encoding="utf-8"))
+        run_json = json.loads(Path(result["run_json"]).read_text(encoding="utf-8"))
         self.assertEqual(run_json["skipped_count"], 1)
         self.assertIn("duration_ms", run_json)
         self.assertEqual(run_json["html_fetch_count"], 0)
@@ -1164,7 +1167,7 @@ class WizardContractTests(unittest.TestCase):
         finally:
             db.close()
         self.assertEqual(row, ("skipped", "already downloaded previously", url))
-        run_json = json.loads((self.tmp / "out" / "run.json").read_text(encoding="utf-8"))
+        run_json = json.loads(Path(result["run_json"]).read_text(encoding="utf-8"))
         self.assertTrue(run_json["gate_summary"]["latest"]["verify"]["ok"])
 
     def test_verify_run_requires_sidecar_json_and_skip_evidence(self) -> None:
@@ -1353,13 +1356,14 @@ class WizardContractTests(unittest.TestCase):
         original_platform = wechat_wizard.sys.platform
         original_choose = wechat_wizard.choose_network_service
         original_get = wechat_wizard.get_network_proxy_state
+        port = str(wechat_downloader.DEFAULT_PROXY_PORT)
         try:
             wechat_wizard.sys.platform = "darwin"
             wechat_wizard.choose_network_service = lambda service="": "Wi-Fi"
             wechat_wizard.get_network_proxy_state = lambda service: {
                 "service": service,
-                "web": {"enabled_bool": True, "server": "127.0.0.1", "port": "8899"},
-                "secure_web": {"enabled_bool": True, "server": "127.0.0.1", "port": "8899"},
+                "web": {"enabled_bool": True, "server": "127.0.0.1", "port": port},
+                "secure_web": {"enabled_bool": True, "server": "127.0.0.1", "port": port},
             }
 
             result = wechat_wizard.check_system_proxy_recoverability(self.tmp)
@@ -1376,10 +1380,11 @@ class WizardContractTests(unittest.TestCase):
         original_platform = wechat_wizard.sys.platform
         original_choose = wechat_wizard.choose_network_service
         original_get = wechat_wizard.get_network_proxy_state
+        port = wechat_downloader.DEFAULT_PROXY_PORT
         state_path = wechat_downloader.system_proxy_state_path(self.tmp)
         state_path.parent.mkdir(parents=True, exist_ok=True)
         state_path.write_text(
-            json.dumps({"service": "Wi-Fi", "new": {"host": "127.0.0.1", "port": 8899}, "previous": {"web": {}, "secure_web": {}}}),
+            json.dumps({"service": "Wi-Fi", "new": {"host": "127.0.0.1", "port": port}, "previous": {"web": {}, "secure_web": {}}}),
             encoding="utf-8",
         )
         try:
@@ -1387,7 +1392,7 @@ class WizardContractTests(unittest.TestCase):
             wechat_wizard.choose_network_service = lambda service="": "Wi-Fi"
             wechat_wizard.get_network_proxy_state = lambda service: {
                 "service": service,
-                "web": {"enabled_bool": True, "server": "localhost", "port": "8899"},
+                "web": {"enabled_bool": True, "server": "localhost", "port": str(port)},
                 "secure_web": {"enabled_bool": False, "server": "", "port": "0"},
             }
 
@@ -1404,10 +1409,46 @@ class WizardContractTests(unittest.TestCase):
         self.assertEqual(result["recoverability"], "saved_state")
         self.assertIn("history-proxy-disable", result["next_action"])
 
+    def test_doctor_system_proxy_marks_active_random_proxy_recoverable(self) -> None:
+        original_platform = wechat_wizard.sys.platform
+        original_choose = wechat_wizard.choose_network_service
+        original_get = wechat_wizard.get_network_proxy_state
+        original_active = wechat_wizard.active_proxy_port
+        port = 23555
+        state_path = wechat_downloader.system_proxy_state_path(self.tmp)
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(
+            json.dumps({"service": "Wi-Fi", "new": {"host": "127.0.0.1", "port": port}, "previous": {"web": {}, "secure_web": {}}}),
+            encoding="utf-8",
+        )
+        try:
+            wechat_wizard.sys.platform = "darwin"
+            wechat_wizard.choose_network_service = lambda service="": "Wi-Fi"
+            wechat_wizard.active_proxy_port = lambda base: port
+            wechat_wizard.get_network_proxy_state = lambda service: {
+                "service": service,
+                "web": {"enabled_bool": True, "server": "127.0.0.1", "port": str(port)},
+                "secure_web": {"enabled_bool": False, "server": "", "port": "0"},
+            }
+
+            result = wechat_wizard.check_system_proxy_recoverability(self.tmp)
+        finally:
+            wechat_wizard.sys.platform = original_platform
+            wechat_wizard.choose_network_service = original_choose
+            wechat_wizard.get_network_proxy_state = original_get
+            wechat_wizard.active_proxy_port = original_active
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["points_to_history_proxy"])
+        self.assertIn(port, result["monitored_ports"])
+        self.assertTrue(result["saved_state_matches"])
+        self.assertEqual(result["recoverability"], "saved_state")
+
     def test_doctor_system_proxy_does_not_trust_stale_saved_state(self) -> None:
         original_platform = wechat_wizard.sys.platform
         original_choose = wechat_wizard.choose_network_service
         original_get = wechat_wizard.get_network_proxy_state
+        port = str(wechat_downloader.DEFAULT_PROXY_PORT)
         state_path = wechat_downloader.system_proxy_state_path(self.tmp)
         state_path.parent.mkdir(parents=True, exist_ok=True)
         state_path.write_text(
@@ -1419,7 +1460,7 @@ class WizardContractTests(unittest.TestCase):
             wechat_wizard.choose_network_service = lambda service="": "Wi-Fi"
             wechat_wizard.get_network_proxy_state = lambda service: {
                 "service": service,
-                "web": {"enabled_bool": True, "server": "127.0.0.1", "port": "8899"},
+                "web": {"enabled_bool": True, "server": "127.0.0.1", "port": port},
                 "secure_web": {"enabled_bool": False, "server": "", "port": "0"},
             }
 
@@ -1440,10 +1481,11 @@ class WizardContractTests(unittest.TestCase):
         original_platform = wechat_wizard.sys.platform
         original_choose = wechat_wizard.choose_network_service
         original_get = wechat_wizard.get_network_proxy_state
+        port = wechat_downloader.DEFAULT_PROXY_PORT
         state_path = wechat_downloader.system_proxy_state_path(self.tmp)
         state_path.parent.mkdir(parents=True, exist_ok=True)
         state_path.write_text(
-            json.dumps({"service": "Wi-Fi", "new": {"host": "127.0.0.1", "port": 8899}, "previous": {}}),
+            json.dumps({"service": "Wi-Fi", "new": {"host": "127.0.0.1", "port": port}, "previous": {}}),
             encoding="utf-8",
         )
         try:
@@ -1451,7 +1493,7 @@ class WizardContractTests(unittest.TestCase):
             wechat_wizard.choose_network_service = lambda service="": "Wi-Fi"
             wechat_wizard.get_network_proxy_state = lambda service: {
                 "service": service,
-                "web": {"enabled_bool": True, "server": "127.0.0.1", "port": "8899"},
+                "web": {"enabled_bool": True, "server": "127.0.0.1", "port": str(port)},
                 "secure_web": {"enabled_bool": False, "server": "", "port": "0"},
             }
 
@@ -1958,7 +2000,7 @@ class WizardContractTests(unittest.TestCase):
                 "stopped": True,
                 "pid": 1234,
             }
-            result = wechat_downloader.finish_history_capture(self.tmp, "session-a", 50, True)
+            result = wechat_downloader.finish_history_capture(self.tmp, "session-a", 50, True, stop_proxy=True)
         finally:
             wechat_downloader.disable_system_proxy = original_disable
             wechat_downloader.stop_history_proxy = original_stop

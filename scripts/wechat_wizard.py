@@ -30,6 +30,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 from wechat_downloader import (  # noqa: E402
     DEFAULT_DELIVERY_DIR,
     DEFAULT_PROXY_PORT,
+    active_proxy_port,
     build_history_open_url,
     choose_network_service,
     extract_urls,
@@ -1224,7 +1225,8 @@ def run_url_mode(
         return result
 
     owner = f"{task_id}:{os.getpid()}"
-    lock_name = "download:" + hashlib.sha256(str(out_dir).encode("utf-8")).hexdigest()[:16]
+    lock_scope_dir = Path(output_dir_arg).expanduser().resolve() if output_dir_arg else out_dir
+    lock_name = "download:" + hashlib.sha256(str(lock_scope_dir).encode("utf-8")).hexdigest()[:16]
     lock = acquire_lock(base, lock_name, owner)
     if not lock["ok"]:
         event = record_gate(base, task_id, "download", "failed_recoverable", False, lock, "download output directory is locked")
@@ -2316,6 +2318,26 @@ def saved_proxy_state_matches(saved: dict[str, Any], service: str, endpoint: str
     return saved_service == service and normalize_proxy_endpoint(f"{host}:{port}") == normalize_proxy_endpoint(endpoint)
 
 
+def current_project_proxy_ports(base: Path, default_port: int = DEFAULT_PROXY_PORT) -> list[int]:
+    ports: list[int] = []
+    try:
+        if default_port:
+            ports.append(int(default_port))
+    except (TypeError, ValueError):
+        pass
+    try:
+        active = active_proxy_port(base)
+        if active:
+            ports.append(int(active))
+    except Exception:
+        pass
+    deduped: list[int] = []
+    for item in ports:
+        if item not in deduped:
+            deduped.append(item)
+    return deduped
+
+
 def check_system_proxy_recoverability(base: Path, port: int = DEFAULT_PROXY_PORT) -> dict[str, Any]:
     state_path = system_proxy_state_path(base)
     saved_state_exists = state_path.exists()
@@ -2344,10 +2366,14 @@ def check_system_proxy_recoverability(base: Path, port: int = DEFAULT_PROXY_PORT
 
     web_endpoint = proxy_endpoint(state.get("web", {}))
     secure_endpoint = proxy_endpoint(state.get("secure_web", {}))
-    local_proxy = f"127.0.0.1:{port}"
-    local_alias = f"localhost:{port}"
-    points_to_history_proxy = web_endpoint in {local_proxy, local_alias} or secure_endpoint in {local_proxy, local_alias}
-    matching_endpoint = web_endpoint if web_endpoint in {local_proxy, local_alias} else secure_endpoint
+    monitored_ports = current_project_proxy_ports(base, port)
+    monitored_endpoints = {
+        endpoint
+        for item in monitored_ports
+        for endpoint in (f"127.0.0.1:{item}", f"localhost:{item}")
+    }
+    points_to_history_proxy = web_endpoint in monitored_endpoints or secure_endpoint in monitored_endpoints
+    matching_endpoint = web_endpoint if web_endpoint in monitored_endpoints else secure_endpoint
     saved_state_matches = bool(points_to_history_proxy and saved_proxy_state_matches(saved_state, service, matching_endpoint))
     ok = not points_to_history_proxy or saved_state_matches
     recoverability = "not_needed"
@@ -2368,6 +2394,7 @@ def check_system_proxy_recoverability(base: Path, port: int = DEFAULT_PROXY_PORT
         "web_proxy": web_endpoint,
         "secure_web_proxy": secure_endpoint,
         "points_to_history_proxy": points_to_history_proxy,
+        "monitored_ports": monitored_ports,
         "saved_state_exists": saved_state_exists,
         "saved_state_matches": saved_state_matches,
         "recoverability": recoverability,

@@ -2621,6 +2621,24 @@ def command_download_collection(args: argparse.Namespace) -> int:
     return 0 if result.get("ok") else 1
 
 
+def command_metrics_import(args: argparse.Namespace) -> int:
+    result = import_metrics(runtime_dir(args.runtime_dir), args.input)
+    write_json_response(result)
+    return 0 if result.get("ok") else 1
+
+
+def command_comments_import(args: argparse.Namespace) -> int:
+    result = import_comments(runtime_dir(args.runtime_dir), args.input)
+    write_json_response(result)
+    return 0 if result.get("ok") else 1
+
+
+def command_comments(args: argparse.Namespace) -> int:
+    rows = list_comments(runtime_dir(args.runtime_dir), args.article_id, args.limit)
+    write_json_response({"ok": True, "count": len(rows), "comments": rows})
+    return 0
+
+
 def normalize_match_text(value: Any) -> str:
     return re.sub(r"\s+", "", str(value or "").lower())
 
@@ -3320,6 +3338,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output-dir", default="")
     p.add_argument("--no-assets", action="store_true")
     p.set_defaults(func=command_download_collection)
+
+    p = sub.add_parser("exporter-metrics-import")
+    p.add_argument("--runtime-dir", default=argparse.SUPPRESS)
+    p.add_argument("input", help="JSON/CSV path or inline JSON payload")
+    p.set_defaults(func=command_metrics_import)
+
+    p = sub.add_parser("exporter-comments-import")
+    p.add_argument("--runtime-dir", default=argparse.SUPPRESS)
+    p.add_argument("input", help="JSON/CSV path or inline JSON payload")
+    p.set_defaults(func=command_comments_import)
+
+    p = sub.add_parser("exporter-comments")
+    p.add_argument("--runtime-dir", default=argparse.SUPPRESS)
+    p.add_argument("--article-id", type=int, required=True)
+    p.add_argument("--limit", type=int, default=100)
+    p.set_defaults(func=command_comments)
 
     p = sub.add_parser("exporter-wizard")
     p.add_argument("--runtime-dir", default=argparse.SUPPRESS)
