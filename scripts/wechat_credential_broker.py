@@ -204,8 +204,9 @@ class WeChatCredentialBroker:
             }
         except urllib.error.HTTPError as exc:
             return {"ok": False, "article_id": article_id, "error": f"http_{exc.code}"}
-        except urllib.error.URLError:
-            return {"ok": False, "article_id": article_id, "error": "network_error"}
+        except urllib.error.URLError as exc:
+            reason = type(exc.reason).__name__ if exc.reason else "unknown"
+            return {"ok": False, "article_id": article_id, "error": f"network_error_{reason}"}
         except TimeoutError:
             return {"ok": False, "article_id": article_id, "error": "timeout"}
         except Exception:
