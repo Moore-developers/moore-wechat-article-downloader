@@ -95,13 +95,17 @@ class WeChatCredentialBroker:
         except FileNotFoundError:
             pass
 
-    def capture(self, request_url: str, request_headers: Any, response_headers: Any = None) -> bool:
+    def capture(self, request_url: str, request_headers: Any, response_headers: Any = None, response_text: str = "") -> bool:
         parsed = urllib.parse.urlsplit(request_url)
         query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
         biz = str((query.get("__biz") or [""])[0]).strip()
         if not biz:
             return False
         values = {key: str((query.get(key) or [""])[0]).strip() for key in ("uin", "key", "pass_ticket", "appmsg_token")}
+        if not values["appmsg_token"]:
+            match = re.search(r"(?:var\s+)?appmsg_token\s*[:=]\s*['\"]([^'\"\\]{6,512})", response_text or "", re.I)
+            if match:
+                values["appmsg_token"] = match.group(1)
         cookie = self._header_value(request_headers, "cookie")
         set_cookie = self._header_value(response_headers, "set-cookie")
         if set_cookie:

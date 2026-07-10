@@ -80,6 +80,18 @@ class CredentialBrokerTests(unittest.TestCase):
             self.assertNotIn(value, serialized)
         self.assertEqual(len(calls), 2)
 
+    def test_capture_reads_appmsg_token_only_from_in_memory_response_text(self) -> None:
+        broker = WeChatCredentialBroker(self.tmp / "capture.sock", "session", "capability-test")
+        captured = broker.capture(
+            "https://mp.weixin.qq.com/s/demo?__biz=MzDemo&uin=12&key=key-secret&pass_ticket=ticket-secret",
+            {"cookie": "wap_sid2=cookie-secret"},
+            response_text="var appmsg_token = 'token-from-html';",
+        )
+        self.assertTrue(captured)
+        status = broker.status("MzDemo")
+        self.assertEqual(status["credentials"][0]["status"], "valid")
+        self.assertNotIn("token-from-html", str(status))
+
     def test_rejects_non_wechat_url_and_comment_api_error(self) -> None:
         calls: list[str] = []
 

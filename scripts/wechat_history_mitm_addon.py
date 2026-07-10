@@ -1072,7 +1072,13 @@ class WeChatHistoryCapture:
         ):
             return
         broker = self.ensure_credential_broker(context)
-        if not broker or not broker.capture(request.url, request.headers, flow.response.headers if flow.response else None):
+        response_text = ""
+        if is_article_page(request.host, request.path, content_type):
+            try:
+                response_text = flow.response.get_text(strict=False) if flow.response else ""
+            except Exception:
+                response_text = ""
+        if not broker or not broker.capture(request.url, request.headers, flow.response.headers if flow.response else None, response_text):
             return
         biz = str((urllib.parse.parse_qs(urllib.parse.urlsplit(request.url).query).get("__biz") or [""])[0])
         status = broker.status(biz).get("credentials", [])
