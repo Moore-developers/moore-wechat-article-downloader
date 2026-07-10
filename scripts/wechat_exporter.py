@@ -40,16 +40,20 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 from wechat_downloader import (  # noqa: E402
     DEFAULT_DELIVERY_DIR,
+    PAGE_DATA_END,
+    PAGE_DATA_START,
     clean_url,
     copy_to_clipboard,
     extract_wechat_article_context,
     make_run_id,
+    markdown_cell,
     run_markdown_only_download,
     runtime_dir,
     safe_display_url,
     safe_name,
     sanitize_text_urls,
     scrub_payload,
+    start_proxy_enhancer_session,
     utc_now,
 )
 from wechat_credential_broker import broker_request, credential_capability_path, credential_socket_path  # noqa: E402
@@ -295,6 +299,19 @@ def migrate_exporter_db(db: sqlite3.Connection) -> None:
             expires_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             FOREIGN KEY(article_id) REFERENCES articles(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS evolution_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id TEXT NOT NULL UNIQUE,
+            stage TEXT NOT NULL,
+            code TEXT NOT NULL,
+            severity TEXT NOT NULL DEFAULT 'info',
+            account_id INTEGER NOT NULL DEFAULT 0,
+            article_id INTEGER NOT NULL DEFAULT 0,
+            run_id TEXT NOT NULL DEFAULT '',
+            detail_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL
         );
         """
     )
@@ -1012,9 +1029,10 @@ def resolve_article_context(
         if not row:
             return {"ok": False, "error": "article not found", "article_id": article_id}
         account_id = int(row["account_id"])
-        resolved_biz = str(biz or biz_from_article_url(str(row["url"] or ""))).strip()
-        mapped = db.execute("SELECT account_id FROM account_biz_mappings WHERE biz = ?", (resolved_biz,)).fetchone() if resolved_biz else None
         account_mapping = db.execute("SELECT biz FROM account_biz_mappings WHERE account_id = ?", (account_id,)).fetchone()
+        explicit_biz = str(biz or biz_from_article_url(str(row["url"] or ""))).strip()
+        resolved_biz = explicit_biz or (str(account_mapping["biz"] or "").strip() if account_mapping else "")
+        mapped = db.execute("SELECT account_id FROM account_biz_mappings WHERE biz = ?", (resolved_biz,)).fetchone() if resolved_biz else None
         if mapped and int(mapped["account_id"]) != account_id:
             return {
                 "ok": False,
@@ -1721,8 +1739,155 @@ def account_index_file_exists(output_dir: Path, row: dict[str, Any]) -> tuple[bo
 def account_output_dir(root: str, account_name: str) -> Path:
     safe_account = _safe_dir_name(account_name)
     if root:
-        return (Path(root).expanduser().resolve() / safe_account).resolve()
+        root_path = Path(root).expanduser().resolve()
+        if root_path.name == safe_account:
+            return root_path
+        return (root_path / safe_account).resolve()
     return (DEFAULT_DELIVERY_DIR / safe_account).expanduser().resolve()
+
+
+def log_evolution_event(
+    base: Path,
+    stage: str,
+    code: str,
+    severity: str = "info",
+    account_id: int = 0,
+    article_id: int = 0,
+    run_id: str = "",
+    detail: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    init_exporter_db(base)
+    event_id = "evo-" + make_run_id()
+    safe_detail = scrub_payload(detail or {})
+    db = connect_db(base)
+    try:
+        db.execute(
+            """
+            INSERT INTO evolution_events
+                (event_id, stage, code, severity, account_id, article_id, run_id, detail_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event_id,
+                stage,
+                code,
+                severity,
+                int(account_id or 0),
+                int(article_id or 0),
+                run_id,
+                json_dumps(safe_detail),
+                utc_now(),
+            ),
+        )
+        db.commit()
+    finally:
+        db.close()
+    return {"event_id": event_id, "stage": stage, "code": code}
+
+
+def list_evolution_events(base: Path, limit: int = 50) -> list[dict[str, Any]]:
+    init_exporter_db(base)
+    db = connect_db(base)
+    try:
+        rows = db.execute(
+            """
+            SELECT event_id, stage, code, severity, account_id, article_id, run_id, detail_json, created_at
+            FROM evolution_events
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (max(1, min(int(limit or 50), 500)),),
+        ).fetchall()
+    finally:
+        db.close()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["detail"] = load_json_text(str(item.pop("detail_json") or "{}")) or {}
+        result.append(item)
+    return result
+
+
+def export_evolution_fixture(base: Path, output_path: str, limit: int = 50) -> dict[str, Any]:
+    events = list_evolution_events(base, limit)
+    payload = scrub_payload(
+        {
+            "version": 1,
+            "created_at": utc_now(),
+            "source": "wechat-collection-diagnostics",
+            "event_count": len(events),
+            "events": events,
+            "reference_project_checklist": [
+                "确认竞品是否仅获取精选评论，不宣称全量评论。",
+                "确认互动接口参数来源：__biz、msgid、idx、comment_id 与短时会话凭证。",
+                "确认失败事件是否能复现到本地 fixture，且不包含 cookie/token/key/pass_ticket/auth-key。",
+            ],
+        }
+    )
+    path = Path(output_path).expanduser()
+    if not path.is_absolute():
+        path = (base / path).resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return {"ok": True, "fixture": str(path), "event_count": len(events)}
+
+
+def verify_account_library(base: Path, account_id: int, output_dir: Path) -> dict[str, Any]:
+    init_exporter_db(base)
+    indexed = read_account_index(output_dir)
+    issues: list[dict[str, Any]] = []
+    fixed = 0
+    db = connect_db(base)
+    try:
+        rows = db.execute(
+            """
+            SELECT id, title, url, content_downloaded
+            FROM articles
+            WHERE account_id = ?
+            """,
+            (account_id,),
+        ).fetchall()
+        for row in rows:
+            item = dict(row)
+            index_item = indexed.get(str(item["id"])) or indexed.get(str(item["url"] or ""))
+            markdown_rel = str((index_item or {}).get("markdown_path") or "")
+            markdown_exists = False
+            if markdown_rel:
+                markdown_path = Path(markdown_rel)
+                if not markdown_path.is_absolute():
+                    markdown_path = output_dir / markdown_path
+                markdown_exists = markdown_path.exists()
+            if int(item.get("content_downloaded") or 0) and not markdown_exists:
+                issues.append(
+                    {
+                        "article_id": int(item["id"]),
+                        "code": "downloaded_markdown_missing",
+                        "title": str(item.get("title") or ""),
+                    }
+                )
+                db.execute("UPDATE articles SET content_downloaded = 0, updated_at = ? WHERE id = ?", (utc_now(), int(item["id"])))
+                fixed += 1
+            if index_item and str(index_item.get("status") or "") == "success" and not markdown_exists:
+                issues.append(
+                    {
+                        "article_id": int(item["id"]),
+                        "code": "index_markdown_missing",
+                        "title": str(item.get("title") or ""),
+                    }
+                )
+        db.commit()
+    finally:
+        db.close()
+    if issues:
+        log_evolution_event(
+            base,
+            "library_verify",
+            "library_inconsistent",
+            "warning",
+            account_id=account_id,
+            detail={"issue_count": len(issues), "fixed_count": fixed, "issue_codes": sorted({item["code"] for item in issues})},
+        )
+    return {"ok": not issues, "issue_count": len(issues), "fixed_count": fixed, "issues": issues[:20]}
 
 
 def download_account_articles(
@@ -1730,6 +1895,7 @@ def download_account_articles(
     rows: list[dict[str, Any]],
     output_root: str = "",
     no_assets: bool = False,
+    force: bool = False,
 ) -> dict[str, Any]:
     if not rows:
         raise RuntimeError("no articles selected")
@@ -1741,7 +1907,7 @@ def download_account_articles(
     missing_downloaded_ids: list[int] = []
     for row in rows:
         exists, index_item = account_index_file_exists(out_dir, row)
-        if exists:
+        if exists and not force:
             skipped.append({
                 "article_id": int(row["id"]),
                 "title": row.get("title", ""),
@@ -1752,11 +1918,13 @@ def download_account_articles(
                 "skip_reason": "file_exists",
             })
         else:
-            if int(row.get("content_downloaded") or 0):
+            if exists or int(row.get("content_downloaded") or 0):
                 redownload_count += 1
+            if int(row.get("content_downloaded") or 0):
                 missing_downloaded_ids.append(int(row["id"]))
             rows_to_download.append(row)
     if not rows_to_download:
+        library_check = verify_account_library(base, int(rows[0].get("account_id") or 0), out_dir)
         return {
             "ok": True,
             "run_id": "",
@@ -1771,6 +1939,7 @@ def download_account_articles(
             "redownload_count": 0,
             "skipped": skipped,
             "failed": [],
+            "library_check": library_check,
         }
     pairs = [(int(row["id"]), str(row["url"])) for row in rows_to_download]
     urls = [url for _article_id, url in pairs]
@@ -1827,6 +1996,7 @@ def download_account_articles(
                     source="public_html",
                 )
             )
+    library_check = verify_account_library(base, int(rows[0].get("account_id") or 0), out_dir)
     return {
         "ok": manifest["failure_count"] == 0,
         "run_id": manifest["run_id"],
@@ -1842,6 +2012,7 @@ def download_account_articles(
         "skipped": skipped,
         "failed": manifest["failed"],
         "article_contexts": context_results,
+        "library_check": library_check,
     }
 
 
@@ -1851,6 +2022,7 @@ def download_articles(
     output_dir: str = "",
     no_assets: bool = False,
     account_nickname: str = "",
+    force: bool = False,
 ) -> dict[str, Any]:
     rows = get_article_download_rows(base, article_ids)
     if not rows:
@@ -1860,8 +2032,8 @@ def download_articles(
         grouped.setdefault(int(row.get("account_id") or 0), []).append(row)
     if len(grouped) == 1:
         only_rows = next(iter(grouped.values()))
-        return download_account_articles(base, only_rows, output_dir, no_assets)
-    results = [download_account_articles(base, group_rows, output_dir, no_assets) for _account_id, group_rows in sorted(grouped.items())]
+        return download_account_articles(base, only_rows, output_dir, no_assets, force)
+    results = [download_account_articles(base, group_rows, output_dir, no_assets, force) for _account_id, group_rows in sorted(grouped.items())]
     return {
         "ok": all(result.get("ok") for result in results),
         "mode": "multi-account",
@@ -1876,6 +2048,182 @@ def download_articles(
         "indexes": [result.get("index") for result in results],
         "skipped": [item for result in results for item in result.get("skipped", [])],
         "failed": [item for result in results for item in result.get("failed", [])],
+    }
+
+
+def latest_metrics_by_article(base: Path, article_ids: list[int]) -> dict[int, dict[str, Any]]:
+    if not article_ids:
+        return {}
+    placeholders = ",".join("?" for _ in article_ids)
+    db = connect_db(base)
+    try:
+        rows = db.execute(
+            f"""
+            SELECT m.*
+            FROM article_metrics m
+            JOIN (
+                SELECT article_id, MAX(captured_at) AS captured_at
+                FROM article_metrics
+                WHERE article_id IN ({placeholders})
+                GROUP BY article_id
+            ) latest
+              ON latest.article_id = m.article_id
+             AND latest.captured_at = m.captured_at
+            """,
+            article_ids,
+        ).fetchall()
+        return {int(row["article_id"]): dict(row) for row in rows}
+    finally:
+        db.close()
+
+
+def elected_comments_by_article(base: Path, article_ids: list[int], limit_per_article: int = 100) -> dict[int, list[dict[str, Any]]]:
+    if not article_ids:
+        return {}
+    placeholders = ",".join("?" for _ in article_ids)
+    db = connect_db(base)
+    try:
+        rows = db.execute(
+            f"""
+            SELECT *
+            FROM article_comments
+            WHERE article_id IN ({placeholders})
+              AND comment_scope = 'elected'
+            ORDER BY article_id, like_count DESC, create_time DESC, id DESC
+            """,
+            article_ids,
+        ).fetchall()
+    finally:
+        db.close()
+    result: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        article_id = int(row["article_id"])
+        items = result.setdefault(article_id, [])
+        if len(items) < max(1, limit_per_article):
+            items.append(dict(row))
+    return result
+
+
+def render_engagement_page_data_markdown(metrics: dict[str, Any] | None, comments: list[dict[str, Any]], captured_at: str = "") -> str:
+    metrics = metrics or {}
+    metric_labels = [
+        ("read_count", "阅读"),
+        ("like_count", "点赞"),
+        ("old_like_count", "在看"),
+        ("comment_count", "评论数"),
+        ("favorite_count", "收藏数"),
+        ("share_count", "分享"),
+    ]
+    lines = [
+        PAGE_DATA_START,
+        "",
+        "## 页面数据",
+        "",
+        f"- 抓取时间：{captured_at or metrics.get('captured_at') or utc_now()}",
+        "- 数据来源：微信短时会话接口",
+        "- 数据边界：只包含接口返回的互动指标和精选评论；不等于全量评论或完整回复树。",
+        "",
+        "### 互动数据",
+        "",
+        "| 字段 | 值 | 来源 |",
+        "|---|---:|---|",
+    ]
+    for key, label in metric_labels:
+        value = metrics.get(key)
+        display = "missing" if value is None or value == "" else str(value)
+        source = str(metrics.get("source") or "wechat_session_api") if display != "missing" else "missing"
+        lines.append(f"| {label} | {markdown_cell(display)} | {markdown_cell(source)} |")
+    lines.extend(
+        [
+            "",
+            "### 精选评论",
+            "",
+            f"- 评论范围：精选评论",
+            f"- 评论数量：{len(comments)}",
+        ]
+    )
+    if comments:
+        lines.extend(["", "| 序号 | 昵称 | 时间 | 点赞 | 评论 |", "|---:|---|---|---:|---|"])
+        for index, item in enumerate(comments, start=1):
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        str(index),
+                        markdown_cell(item.get("nick_name") or "missing"),
+                        markdown_cell(item.get("create_time") or "missing"),
+                        markdown_cell(item.get("like_count") if item.get("like_count") is not None else "missing"),
+                        markdown_cell(item.get("content") or "missing"),
+                    ]
+                )
+                + " |"
+            )
+    else:
+        lines.extend(["", "- missing"])
+    lines.extend(["", PAGE_DATA_END, ""])
+    return "\n".join(lines)
+
+
+def upsert_markdown_section(markdown_path: Path, section: str) -> bool:
+    if not markdown_path.exists():
+        return False
+    current = markdown_path.read_text(encoding="utf-8")
+    block_re = re.compile(rf"\n*{re.escape(PAGE_DATA_START)}.*?{re.escape(PAGE_DATA_END)}\n*", re.S)
+    if block_re.search(current):
+        updated = block_re.sub("\n\n" + section.strip() + "\n", current).rstrip() + "\n"
+    else:
+        updated = current.rstrip() + "\n\n" + section.strip() + "\n"
+    if updated != current:
+        markdown_path.write_text(updated, encoding="utf-8")
+    return True
+
+
+def write_engagement_to_markdown(base: Path, article_ids: list[int], output_root: str = "") -> dict[str, Any]:
+    rows = get_article_download_rows(base, article_ids)
+    if not rows:
+        return {"ok": False, "error": "no articles selected", "updated_count": 0, "missing_count": 0}
+    metrics_by_article = latest_metrics_by_article(base, [int(row["id"]) for row in rows])
+    comments_by_article = elected_comments_by_article(base, [int(row["id"]) for row in rows])
+    updated: list[dict[str, Any]] = []
+    missing: list[dict[str, Any]] = []
+    by_account: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        by_account.setdefault(int(row.get("account_id") or 0), []).append(row)
+    for _account_id, account_rows in by_account.items():
+        account_name = str(account_rows[0].get("account_name") or "account")
+        out_dir = account_output_dir(output_root, account_name)
+        index = read_account_index(out_dir)
+        for row in account_rows:
+            article_id = int(row["id"])
+            indexed = index.get(str(article_id)) or index.get(str(row.get("url") or ""))
+            markdown_rel = str((indexed or {}).get("markdown_path") or "")
+            markdown_path = Path(markdown_rel) if markdown_rel else Path()
+            if markdown_rel and not markdown_path.is_absolute():
+                markdown_path = out_dir / markdown_path
+            if not markdown_rel or not markdown_path.exists():
+                missing.append({"article_id": article_id, "title": row.get("title", ""), "code": "markdown_missing"})
+                continue
+            section = render_engagement_page_data_markdown(
+                metrics_by_article.get(article_id),
+                comments_by_article.get(article_id, []),
+            )
+            if upsert_markdown_section(markdown_path, section):
+                updated.append({"article_id": article_id, "title": row.get("title", ""), "markdown_path": str(markdown_path)})
+    if missing:
+        log_evolution_event(
+            base,
+            "markdown_writeback",
+            "markdown_missing",
+            "warning",
+            account_id=int(rows[0].get("account_id") or 0),
+            detail={"missing_count": len(missing), "article_count": len(rows)},
+        )
+    return {
+        "ok": not missing,
+        "updated_count": len(updated),
+        "missing_count": len(missing),
+        "updated": updated,
+        "missing": missing,
     }
 
 
@@ -2155,10 +2503,14 @@ def ready_engagement_contexts(base: Path, account_id: int, limit: int) -> list[d
     try:
         rows = db.execute(
             """
-            SELECT c.article_id, c.account_id, c.biz, c.msgid, c.idx, c.comment_id, c.url
+            SELECT c.article_id, c.account_id, COALESCE(NULLIF(c.biz, ''), m.biz) AS biz, c.msgid, c.idx, c.comment_id, c.url
             FROM article_contexts c
             JOIN articles a ON a.id = c.article_id
-            WHERE c.account_id = ? AND c.context_status = 'ready'
+            LEFT JOIN account_biz_mappings m ON m.account_id = c.account_id
+            WHERE c.account_id = ?
+              AND COALESCE(NULLIF(c.biz, ''), m.biz, '') <> ''
+              AND c.msgid <> ''
+              AND c.comment_id <> ''
             ORDER BY a.publish_time DESC, c.article_id DESC
             LIMIT ?
             """,
@@ -2227,7 +2579,15 @@ def contexts_for_engagement_run(base: Path, run_id: str) -> tuple[dict[str, Any]
             return run, []
         placeholders = ",".join("?" for _ in ids)
         rows = db.execute(
-            f"SELECT article_id, account_id, biz, msgid, idx, comment_id, url FROM article_contexts WHERE article_id IN ({placeholders}) AND context_status = 'ready'",
+            f"""
+            SELECT c.article_id, c.account_id, COALESCE(NULLIF(c.biz, ''), m.biz) AS biz, c.msgid, c.idx, c.comment_id, c.url
+            FROM article_contexts c
+            LEFT JOIN account_biz_mappings m ON m.account_id = c.account_id
+            WHERE c.article_id IN ({placeholders})
+              AND COALESCE(NULLIF(c.biz, ''), m.biz, '') <> ''
+              AND c.msgid <> ''
+              AND c.comment_id <> ''
+            """,
             ids,
         ).fetchall()
         by_id = {int(item["article_id"]): dict(item) for item in rows}
@@ -2339,6 +2699,15 @@ def execute_engagement_run(base: Path, run_id: str) -> dict[str, Any]:
         payload = None
     if payload is not None:
         error = str(payload.get("error") or "valid credential is unavailable")
+        log_evolution_event(
+            base,
+            "engagement_sync",
+            str(payload.get("status") or "waiting_credential"),
+            "warning",
+            account_id=int(run.get("account_id") or 0) if run else 0,
+            run_id=run_id,
+            detail={"article_count": len(contexts), "error": error},
+        )
         db = connect_db(base)
         try:
             db.execute("UPDATE engagement_runs SET status = 'waiting_credential', error = ?, updated_at = ? WHERE run_id = ?", (error, utc_now(), run_id))
@@ -2372,14 +2741,38 @@ def execute_engagement_run(base: Path, run_id: str) -> dict[str, Any]:
     }
 
 
-def sync_engagement(base: Path, account_id: int, limit: int = 50) -> dict[str, Any]:
+def sync_engagement(
+    base: Path,
+    account_id: int,
+    limit: int = 50,
+    auto_start_collection: bool = True,
+    output_root: str = "",
+) -> dict[str, Any]:
     created = create_engagement_run(base, account_id, limit)
     if not created.get("ok"):
         return created
+    collection_session: dict[str, Any] | None = None
+    if auto_start_collection and not active_collection_broker(base):
+        collection_session = start_proxy_enhancer_session(base, upstream_proxy="auto", yes=True)
+        if not collection_session.get("ok"):
+            log_evolution_event(
+                base,
+                "wechat_collection_start",
+                str(collection_session.get("stage") or collection_session.get("error") or "start_failed"),
+                "error",
+                account_id=account_id,
+                run_id=str(created["run_id"]),
+                detail={"status": collection_session.get("mode") or "", "requires_confirmation": collection_session.get("requires_confirmation", False)},
+            )
     result = execute_engagement_run(base, str(created["run_id"]))
     representative_url = str(created["contexts"][0].get("url") or "")
     if result.get("status") != "waiting_credential" or not representative_url:
-        return {**result, "representative_url": representative_url}
+        writeback = (
+            write_engagement_to_markdown(base, [int(item["article_id"]) for item in created["contexts"]], output_root)
+            if result.get("status") in {"complete", "partial"}
+            else None
+        )
+        return {**result, "representative_url": representative_url, "collection_session": collection_session, "markdown_writeback": writeback}
     copied, clipboard_method = copy_to_clipboard(representative_url)
     return {
         **result,
@@ -2387,19 +2780,39 @@ def sync_engagement(base: Path, account_id: int, limit: int = 50) -> dict[str, A
         "copied_to_clipboard": copied,
         "clipboard_method": clipboard_method if copied else "",
         "clipboard_error": "" if copied else clipboard_method,
+        "collection_session": collection_session,
+        "next_step": "已复制代表文章链接，请粘贴到微信客户端并打开；打开后继续恢复本任务。",
     }
 
 
-def resume_waiting_engagement_runs(base: Path, biz: str = "") -> dict[str, Any]:
+def resume_waiting_engagement_runs(base: Path, biz: str = "", run_id: str = "", output_root: str = "") -> dict[str, Any]:
     init_exporter_db(base)
     db = connect_db(base)
     try:
-        rows = db.execute("SELECT run_id, scope_json FROM engagement_runs WHERE status = 'waiting_credential' ORDER BY created_at").fetchall()
+        if run_id:
+            rows = db.execute(
+                "SELECT run_id, scope_json FROM engagement_runs WHERE status = 'waiting_credential' AND run_id = ?",
+                (run_id,),
+            ).fetchall()
+        else:
+            rows = db.execute("SELECT run_id, scope_json FROM engagement_runs WHERE status = 'waiting_credential' ORDER BY created_at").fetchall()
     finally:
         db.close()
     run_ids = [str(row["run_id"]) for row in rows if not biz or str((load_json_text(row["scope_json"]) or {}).get("biz") or "") == biz]
     results = [execute_engagement_run(base, run_id) for run_id in run_ids]
-    return {"ok": all(result.get("ok") for result in results), "run_count": len(results), "results": results}
+    article_ids: list[int] = []
+    for row in rows:
+        if str(row["run_id"]) not in set(run_ids):
+            continue
+        scope = load_json_text(str(row["scope_json"] or "{}")) or {}
+        article_ids.extend(int(value) for value in scope.get("article_ids", []) if str(value).isdigit())
+    terminal_statuses = {"complete", "partial"}
+    writeback = (
+        write_engagement_to_markdown(base, article_ids, output_root)
+        if article_ids and all(str(result.get("status") or "") in terminal_statuses for result in results)
+        else None
+    )
+    return {"ok": all(result.get("ok") for result in results), "run_count": len(results), "results": results, "markdown_writeback": writeback}
 
 
 def create_dataset_manifest(base: Path, account_id: int, dataset_id: str = "", output_root: str = "") -> dict[str, Any]:
@@ -3176,7 +3589,7 @@ def command_download(args: argparse.Namespace) -> int:
         keyword=args.keyword,
         collection_id=args.collection_id,
     )
-    result = download_articles(base, ids, args.output_dir, args.no_assets)
+    result = download_articles(base, ids, args.output_dir, args.no_assets, force=args.force)
     write_json_response(result)
     return 0 if result.get("ok") else 1
 
@@ -3206,7 +3619,7 @@ def command_collection_add(args: argparse.Namespace) -> int:
 def command_download_collection(args: argparse.Namespace) -> int:
     base = runtime_dir(args.runtime_dir)
     ids = select_article_ids(base, collection_id=args.collection_id)
-    result = download_articles(base, ids, args.output_dir, args.no_assets)
+    result = download_articles(base, ids, args.output_dir, args.no_assets, force=args.force)
     write_json_response(result)
     return 0 if result.get("ok") else 1
 
@@ -3241,15 +3654,31 @@ def command_article_context(args: argparse.Namespace) -> int:
 
 
 def command_wechat_collection_sync_engagement(args: argparse.Namespace) -> int:
-    result = sync_engagement(runtime_dir(args.runtime_dir), args.account_id, args.limit)
+    result = sync_engagement(runtime_dir(args.runtime_dir), args.account_id, args.limit, output_root=args.output_dir)
     write_json_response(scrub_payload(result))
     return 0 if result.get("ok") else 1
 
 
 def command_wechat_collection_resume_engagement(args: argparse.Namespace) -> int:
-    result = resume_waiting_engagement_runs(runtime_dir(args.runtime_dir), args.biz)
+    result = resume_waiting_engagement_runs(runtime_dir(args.runtime_dir), args.biz, args.run_id, args.output_dir)
     write_json_response(scrub_payload(result))
     return 0 if result.get("ok") else 1
+
+
+def command_wechat_collection_writeback(args: argparse.Namespace) -> int:
+    ids = [int(part) for part in re.split(r"[,，\s]+", args.article_ids.strip()) if part.strip()]
+    result = write_engagement_to_markdown(runtime_dir(args.runtime_dir), ids, args.output_dir)
+    write_json_response(scrub_payload(result))
+    return 0 if result.get("ok") else 1
+
+
+def command_wechat_collection_diagnostics(args: argparse.Namespace) -> int:
+    base = runtime_dir(args.runtime_dir)
+    result = {"ok": True, "events": list_evolution_events(base, args.limit)}
+    if args.export_fixture:
+        result["fixture"] = export_evolution_fixture(base, args.export_fixture, args.limit)
+    write_json_response(scrub_payload(result))
+    return 0
 
 
 def command_library_dataset(args: argparse.Namespace) -> int:
@@ -3687,12 +4116,13 @@ def run_wizard_after_account(
         save_wizard_session(base, session_id, str(request.get("target") or ""), "need_article_choice", request, selected_account_id=account_id, result=result)
         return result
 
-    downloaded = download_articles(base, selected_ids, str(request.get("output_dir") or ""), bool(request.get("no_assets")))
+    output_root = str(request.get("output_dir") or "")
+    downloaded = download_articles(base, selected_ids, output_root, bool(request.get("no_assets")), force=True)
     engagement = None
     state = "done"
     if request.get("engagement_mode") == "elected" and downloaded.get("ok"):
-        engagement = sync_engagement(base, account_id, len(selected_ids))
-        state = "waiting_wechat_credential" if engagement.get("status") == "waiting_credential" else "done"
+        engagement = sync_engagement(base, account_id, len(selected_ids), output_root=output_root)
+        state = "waiting_wechat_collection" if engagement.get("status") == "waiting_credential" else "done"
     result = {
         "ok": downloaded.get("ok", False),
         "state": state,
@@ -3703,7 +4133,44 @@ def run_wizard_after_account(
         "download": downloaded,
         "engagement": engagement,
     }
+    if engagement and engagement.get("status") == "waiting_credential":
+        result["next_step"] = engagement.get("next_step") or "已复制代表文章链接，请粘贴到微信客户端并打开；打开后回复“已打开”。"
     save_wizard_session(base, session_id, str(request.get("target") or ""), state, request, selected_account_id=account_id, selected_article_ids=selected_ids, result=result)
+    return result
+
+
+def resume_wizard_wechat_collection(base: Path, session_id: str, session: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
+    previous = dict(session.get("result") or {})
+    engagement = dict(previous.get("engagement") or {})
+    run_id = str(engagement.get("run_id") or "")
+    biz = str(engagement.get("biz") or "")
+    if not biz and run_id:
+        run, _contexts = contexts_for_engagement_run(base, run_id)
+        if run:
+            scope = load_json_text(str(run.get("scope_json") or "{}")) or {}
+            biz = str(scope.get("biz") or "")
+    resumed = resume_waiting_engagement_runs(base, biz, run_id, str(request.get("output_dir") or ""))
+    state = "done" if resumed.get("ok") else "waiting_wechat_collection"
+    result = {
+        **previous,
+        "ok": bool(resumed.get("ok")),
+        "state": state,
+        "session_id": session_id,
+        "resumed_from": "waiting_wechat_collection",
+        "engagement_resume": resumed,
+    }
+    if not resumed.get("ok"):
+        result["next_step"] = "请确认代表文章已在微信客户端打开并加载评论区，然后再次恢复本任务。"
+    save_wizard_session(
+        base,
+        session_id,
+        str(request.get("target") or ""),
+        state,
+        request,
+        selected_account_id=int(session.get("selected_account_id") or 0),
+        selected_article_ids=[int(value) for value in session.get("selected_article_ids", []) if str(value).isdigit()],
+        result=result,
+    )
     return result
 
 
@@ -3714,6 +4181,10 @@ def command_wizard(args: argparse.Namespace) -> int:
         session = load_wizard_session(base, args.resume)
         request = dict(session.get("request") or {})
         session_id = args.resume
+        if session.get("state") in {"waiting_wechat_collection", "waiting_wechat_credential"}:
+            result = resume_wizard_wechat_collection(base, session_id, session, request)
+            write_json_response(scrub_payload(result))
+            return 0 if result.get("ok") else 1
         if session.get("state") == "need_login":
             login_id = str((session.get("result") or {}).get("login_id") or "")
             if login_id:
@@ -3967,6 +4438,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--keyword", default="")
     p.add_argument("--output-dir", default="")
     p.add_argument("--no-assets", action="store_true")
+    p.add_argument("--force", action="store_true", help="Overwrite existing local Markdown instead of skipping")
     p.set_defaults(func=command_download)
 
     p = sub.add_parser("exporter-fields")
@@ -3994,6 +4466,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--collection-id", type=int, required=True)
     p.add_argument("--output-dir", default="")
     p.add_argument("--no-assets", action="store_true")
+    p.add_argument("--force", action="store_true", help="Overwrite existing local Markdown instead of skipping")
     p.set_defaults(func=command_download_collection)
 
     p = sub.add_parser("exporter-metrics-import")
@@ -4025,12 +4498,27 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--runtime-dir", default=argparse.SUPPRESS)
     p.add_argument("--account-id", type=int, required=True)
     p.add_argument("--limit", type=int, default=50)
+    p.add_argument("--output-dir", default="")
     p.set_defaults(func=command_wechat_collection_sync_engagement)
 
     p = sub.add_parser("wechat-collection-resume-engagement")
     p.add_argument("--runtime-dir", default=argparse.SUPPRESS)
     p.add_argument("--biz", default="")
+    p.add_argument("--run-id", default="")
+    p.add_argument("--output-dir", default="")
     p.set_defaults(func=command_wechat_collection_resume_engagement)
+
+    p = sub.add_parser("wechat-collection-writeback")
+    p.add_argument("--runtime-dir", default=argparse.SUPPRESS)
+    p.add_argument("--article-ids", required=True)
+    p.add_argument("--output-dir", default="")
+    p.set_defaults(func=command_wechat_collection_writeback)
+
+    p = sub.add_parser("wechat-collection-diagnostics")
+    p.add_argument("--runtime-dir", default=argparse.SUPPRESS)
+    p.add_argument("--limit", type=int, default=50)
+    p.add_argument("--export-fixture", default="")
+    p.set_defaults(func=command_wechat_collection_diagnostics)
 
     p = sub.add_parser("library-dataset")
     p.add_argument("--runtime-dir", default=argparse.SUPPRESS)

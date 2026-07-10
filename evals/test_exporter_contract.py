@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import csv
 import shutil
 import sqlite3
 import subprocess
@@ -69,6 +70,65 @@ class ExporterContractTests(unittest.TestCase):
 
     def fixture_account_id(self) -> int:
         return int(self.run_cli("exporter-accounts")["accounts"][0]["id"])
+
+    def fixture_account_and_article(self) -> tuple[dict, dict]:
+        self.run_cli("exporter-import-fixture", str(FIXTURE))
+        account = self.run_cli("exporter-accounts")["accounts"][0]
+        article = self.run_cli("exporter-articles", "--account-id", str(account["id"]), "--limit", "1")["articles"][0]
+        return account, article
+
+    def prepare_markdown_index(self, account: dict, article: dict, root: Path, exists: bool = True) -> Path:
+        out_dir = wechat_exporter.account_output_dir(str(root), str(account["nickname"]))
+        article_dir = out_dir / "articles"
+        article_dir.mkdir(parents=True, exist_ok=True)
+        markdown_path = article_dir / "demo.md"
+        if exists:
+            markdown_path.write_text(
+                "# Demo\n\n"
+                f"{wechat_exporter.PAGE_DATA_START}\n\n"
+                "## 页面数据\n\n旧数据\n\n"
+                f"{wechat_exporter.PAGE_DATA_END}\n",
+                encoding="utf-8",
+            )
+        index_path = out_dir / "index.csv"
+        with index_path.open("w", encoding="utf-8", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=["db_article_id", "source_url", "markdown_path", "status", "title"])
+            writer.writeheader()
+            writer.writerow(
+                {
+                    "db_article_id": article["id"],
+                    "source_url": article["url"],
+                    "markdown_path": "articles/demo.md",
+                    "status": "success",
+                    "title": article["title"],
+                }
+            )
+        return markdown_path
+
+    def insert_engagement_rows(self, article_id: int) -> None:
+        now = wechat_exporter.utc_now()
+        db = sqlite3.connect(self.tmp / "exporter.sqlite")
+        try:
+            db.execute(
+                """
+                INSERT INTO article_metrics
+                    (run_id, article_id, source, captured_at, read_count, like_count, old_like_count, share_count, comment_count, raw_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                ("run-test", article_id, "wechat_session_api", now, 123, 9, 3, None, 1, "{}"),
+            )
+            db.execute(
+                """
+                INSERT INTO article_comments
+                    (article_id, comment_id, nick_name, content, like_count, create_time, raw_json, created_at,
+                     comment_scope, source, fetched_at, complete)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (article_id, "comment-test", "读者", "有价值评论", 7, "2026-07-10", "{}", now, "elected", "wechat_session_api", now, 1),
+            )
+            db.commit()
+        finally:
+            db.close()
 
     def test_init_creates_sqlite_schema(self) -> None:
         payload = self.run_cli("exporter-init")
@@ -535,6 +595,80 @@ class ExporterContractTests(unittest.TestCase):
         self.assertEqual(context, ("biz-local", "12345", "public_html"))
         self.assertNotIn("pass_ticket", serialized)
 
+    def test_exporter_download_force_overwrites_existing_markdown(self) -> None:
+        self.run_cli("exporter-import-fixture", str(FIXTURE))
+        article_id = int(self.run_cli("exporter-articles", "--limit", "1")["articles"][0]["id"])
+        article = wechat_exporter.get_article_download_rows(self.tmp, [article_id])[0]
+        root = self.tmp / "delivery"
+        out_dir = wechat_exporter.account_output_dir(str(root), str(article["account_name"]))
+        markdown = out_dir / "articles" / "existing.md"
+        markdown.parent.mkdir(parents=True, exist_ok=True)
+        markdown.write_text("# old\n", encoding="utf-8")
+        wechat_exporter.write_account_index(
+            out_dir,
+            [article],
+            {
+                "articles": [
+                    {
+                        "seq": "001",
+                        "source_url": article["url"],
+                        "status": "success",
+                        "markdown_path": "articles/existing.md",
+                        "image_dir": "",
+                        "image_count": 0,
+                    }
+                ],
+                "failed": [],
+            },
+            "run-existing",
+        )
+        db = sqlite3.connect(self.tmp / "exporter.sqlite")
+        try:
+            db.execute("UPDATE articles SET content_downloaded = 1 WHERE id = ?", (article_id,))
+            db.commit()
+        finally:
+            db.close()
+        article["content_downloaded"] = 1
+        skipped = wechat_exporter.download_account_articles(self.tmp, [article], str(root))
+        self.assertEqual(skipped["skipped_count"], 1)
+
+        calls: list[list[str]] = []
+        original = wechat_exporter.run_markdown_only_download
+
+        def fake_download(urls: list[str], output_dir: Path, _assets: bool, _payload: dict, run_id: str) -> dict:
+            calls.append(urls)
+            markdown.write_text("# new\n", encoding="utf-8")
+            return {
+                "ok": True,
+                "run_id": run_id,
+                "output_dir": str(output_dir),
+                "index": str(output_dir / "index.csv"),
+                "success_count": 1,
+                "failure_count": 0,
+                "articles": [
+                    {
+                        "seq": "001",
+                        "source_url": article["url"],
+                        "status": "success",
+                        "markdown_path": "articles/existing.md",
+                        "image_dir": "",
+                        "image_count": 0,
+                    }
+                ],
+                "failed": [],
+            }
+
+        try:
+            wechat_exporter.run_markdown_only_download = fake_download
+            forced = wechat_exporter.download_account_articles(self.tmp, [article], str(root), force=True)
+        finally:
+            wechat_exporter.run_markdown_only_download = original
+
+        self.assertEqual(calls, [[article["url"]]])
+        self.assertTrue(forced["ok"])
+        self.assertEqual(forced["redownload_count"], 1)
+        self.assertEqual(markdown.read_text(encoding="utf-8"), "# new\n")
+
     def test_article_context_parser_returns_only_safe_identifiers(self) -> None:
         context = wechat_exporter.extract_wechat_article_context(
             "var __biz = 'MzIxNTA1MDEwNg=='; var comment_id = '12345'; var key = 'secret';",
@@ -599,6 +733,118 @@ class ExporterContractTests(unittest.TestCase):
         self.assertEqual(comment, ("elected", "wechat_session_api", 1))
         self.assertEqual(run, ("complete", 1, 0))
 
+    def test_write_engagement_to_markdown_replaces_single_page_data_block(self) -> None:
+        account, article = self.fixture_account_and_article()
+        article_id = int(article["id"])
+        markdown_path = self.prepare_markdown_index(account, article, self.tmp / "library")
+        self.insert_engagement_rows(article_id)
+
+        first = wechat_exporter.write_engagement_to_markdown(self.tmp, [article_id], str(self.tmp / "library"))
+        second = wechat_exporter.write_engagement_to_markdown(self.tmp, [article_id], str(self.tmp / "library"))
+
+        self.assertTrue(first["ok"])
+        self.assertTrue(second["ok"])
+        content = markdown_path.read_text(encoding="utf-8")
+        self.assertEqual(content.count(wechat_exporter.PAGE_DATA_START), 1)
+        self.assertIn("微信短时会话接口", content)
+        self.assertIn("精选评论", content)
+        self.assertIn("读者", content)
+        self.assertIn("有价值评论", content)
+        self.assertNotIn("旧数据", content)
+
+    def test_write_engagement_missing_markdown_logs_diagnostic_without_crashing(self) -> None:
+        account, article = self.fixture_account_and_article()
+        article_id = int(article["id"])
+        self.prepare_markdown_index(account, article, self.tmp / "library", exists=False)
+        self.insert_engagement_rows(article_id)
+
+        result = wechat_exporter.write_engagement_to_markdown(self.tmp, [article_id], str(self.tmp / "library"))
+        events = wechat_exporter.list_evolution_events(self.tmp, 5)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["missing_count"], 1)
+        self.assertEqual(events[0]["stage"], "markdown_writeback")
+        self.assertEqual(events[0]["code"], "markdown_missing")
+
+    def test_diagnostics_can_export_sanitized_evolution_fixture(self) -> None:
+        wechat_exporter.log_evolution_event(
+            self.tmp,
+            "broker",
+            "shape_changed",
+            "warning",
+            detail={
+                "token": "secret-token",
+                "pass_ticket": "secret-ticket",
+                "auth-key": "secret-auth",
+                "safe_shape": {"articles": 1},
+            },
+        )
+
+        payload = self.run_cli("wechat-collection-diagnostics", "--export-fixture", "fixtures/diagnostics.json")
+        fixture_path = Path(payload["fixture"]["fixture"])
+        fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+        serialized = json.dumps(fixture, ensure_ascii=False)
+
+        self.assertTrue(payload["ok"])
+        self.assertTrue(fixture_path.exists())
+        self.assertEqual(fixture["event_count"], 1)
+        self.assertIn("reference_project_checklist", fixture)
+        self.assertNotIn("secret-token", serialized)
+        self.assertNotIn("secret-ticket", serialized)
+        self.assertNotIn("secret-auth", serialized)
+
+    def test_engagement_sync_uses_account_biz_mapping_for_legacy_incomplete_context(self) -> None:
+        self.run_cli("exporter-import-fixture", str(FIXTURE))
+        account = self.run_cli("exporter-accounts")["accounts"][0]
+        account_id = int(account["id"])
+        account_biz = str(account["fakeid"])
+        article = self.run_cli("exporter-articles", "--account-id", str(account_id), "--limit", "1")["articles"][0]
+        self.assertTrue(
+            wechat_exporter.resolve_article_context(
+                self.tmp, int(article["id"]), biz=account_biz, comment_id="legacy-comment"
+            )["ok"]
+        )
+        db = sqlite3.connect(self.tmp / "exporter.sqlite")
+        try:
+            db.execute(
+                "UPDATE article_contexts SET biz = '', context_status = 'incomplete' WHERE article_id = ?",
+                (int(article["id"]),),
+            )
+            db.commit()
+        finally:
+            db.close()
+        context_dir = self.tmp / "context"
+        context_dir.mkdir(parents=True, exist_ok=True)
+        (context_dir / "active-proxy-session.json").write_text(json.dumps({"session_id": "proxy-enhancer-test"}), encoding="utf-8")
+        wechat_exporter.credential_capability_path(self.tmp, "proxy-enhancer-test").write_text("capability-test\n", encoding="utf-8")
+        original = wechat_exporter.broker_request
+
+        def fake_broker_request(_socket: Path, payload: dict, timeout_seconds: float) -> dict:
+            self.assertEqual(payload["biz"], account_biz)
+            self.assertEqual([item["article_id"] for item in payload["articles"]], [article["id"]])
+            self.assertEqual(payload["articles"][0]["biz"], account_biz)
+            return {
+                "ok": True,
+                "articles": [
+                    {
+                        "ok": True,
+                        "article_id": article["id"],
+                        "metrics": {"read_count": 11},
+                        "comments": [],
+                        "comments_complete": True,
+                    }
+                ],
+            }
+
+        try:
+            wechat_exporter.broker_request = fake_broker_request
+            result = wechat_exporter.sync_engagement(self.tmp, account_id, limit=1)
+        finally:
+            wechat_exporter.broker_request = original
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["success_count"], 1)
+
     def test_waiting_engagement_run_resumes_without_creating_another_run(self) -> None:
         self.run_cli("exporter-import-fixture", str(FIXTURE))
         account_id = self.fixture_account_id()
@@ -639,6 +885,206 @@ class ExporterContractTests(unittest.TestCase):
 
         self.assertTrue(resumed["ok"])
         self.assertEqual(resumed["run_count"], 1)
+        db = sqlite3.connect(self.tmp / "exporter.sqlite")
+        try:
+            runs = db.execute("SELECT run_id, status FROM engagement_runs").fetchall()
+        finally:
+            db.close()
+        self.assertEqual(runs, [(created["run_id"], "complete")])
+
+    def test_engagement_writeback_replaces_page_data_section(self) -> None:
+        self.run_cli("exporter-import-fixture", str(FIXTURE))
+        account_id = self.fixture_account_id()
+        article = self.run_cli("exporter-articles", "--account-id", str(account_id), "--limit", "1")["articles"][0]
+        out_dir = self.tmp / "delivery" / "哥飞"
+        article_dir = out_dir / "articles"
+        article_dir.mkdir(parents=True, exist_ok=True)
+        markdown = article_dir / "AI 工具出海实战.md"
+        markdown.write_text(
+            "# AI 工具出海实战\n\n正文\n\n"
+            f"{wechat_exporter.PAGE_DATA_START}\n\n## 页面数据\n\n旧数据\n\n{wechat_exporter.PAGE_DATA_END}\n",
+            encoding="utf-8",
+        )
+        with (out_dir / "index.csv").open("w", encoding="utf-8", newline="") as fh:
+            writer = csv.DictWriter(
+                fh,
+                fieldnames=["db_article_id", "source_url", "status", "markdown_path", "image_dir", "image_count"],
+            )
+            writer.writeheader()
+            writer.writerow(
+                {
+                    "db_article_id": article["id"],
+                    "source_url": article["url"],
+                    "status": "success",
+                    "markdown_path": "articles/AI 工具出海实战.md",
+                    "image_dir": "",
+                    "image_count": "0",
+                }
+            )
+        db = sqlite3.connect(self.tmp / "exporter.sqlite")
+        try:
+            db.execute(
+                """
+                INSERT INTO article_metrics
+                    (run_id, article_id, source, captured_at, read_count, like_count, old_like_count, share_count, comment_count, raw_json)
+                VALUES ('run-writeback', ?, 'wechat_session_api', '2026-07-10T00:00:00Z', 123, 4, 2, 8, 1, '{}')
+                """,
+                (int(article["id"]),),
+            )
+            db.execute(
+                """
+                INSERT INTO article_comments
+                    (article_id, comment_id, nick_name, content, like_count, create_time, raw_json, created_at, comment_scope, source, fetched_at, complete)
+                VALUES (?, 'comment-writeback', '读者A', '这个选题能打', 7, '2026-07-10', '{}', 'now', 'elected', 'wechat_session_api', 'now', 1)
+                """,
+                (int(article["id"]),),
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        result = wechat_exporter.write_engagement_to_markdown(self.tmp, [int(article["id"])], str(self.tmp / "delivery"))
+
+        self.assertTrue(result["ok"])
+        text = markdown.read_text(encoding="utf-8")
+        self.assertEqual(text.count(wechat_exporter.PAGE_DATA_START), 1)
+        self.assertIn("微信短时会话接口", text)
+        self.assertIn("精选评论", text)
+        self.assertIn("这个选题能打", text)
+        self.assertNotIn("旧数据", text)
+
+    def test_library_verify_repairs_missing_downloaded_markdown_and_logs_event(self) -> None:
+        self.run_cli("exporter-import-fixture", str(FIXTURE))
+        account_id = self.fixture_account_id()
+        article = self.run_cli("exporter-articles", "--account-id", str(account_id), "--limit", "1")["articles"][0]
+        out_dir = self.tmp / "delivery" / "哥飞"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        with (out_dir / "index.csv").open("w", encoding="utf-8", newline="") as fh:
+            writer = csv.DictWriter(
+                fh,
+                fieldnames=["db_article_id", "source_url", "status", "markdown_path", "image_dir", "image_count"],
+            )
+            writer.writeheader()
+            writer.writerow(
+                {
+                    "db_article_id": article["id"],
+                    "source_url": article["url"],
+                    "status": "success",
+                    "markdown_path": "articles/missing.md",
+                    "image_dir": "",
+                    "image_count": "0",
+                }
+            )
+        db = sqlite3.connect(self.tmp / "exporter.sqlite")
+        try:
+            db.execute("UPDATE articles SET content_downloaded = 1 WHERE id = ?", (int(article["id"]),))
+            db.commit()
+        finally:
+            db.close()
+
+        result = wechat_exporter.verify_account_library(self.tmp, account_id, out_dir)
+
+        self.assertFalse(result["ok"])
+        self.assertGreaterEqual(result["fixed_count"], 1)
+        db = sqlite3.connect(self.tmp / "exporter.sqlite")
+        try:
+            downloaded = db.execute("SELECT content_downloaded FROM articles WHERE id = ?", (int(article["id"]),)).fetchone()[0]
+            event_count = db.execute("SELECT COUNT(*) FROM evolution_events WHERE code = 'library_inconsistent'").fetchone()[0]
+        finally:
+            db.close()
+        self.assertEqual(downloaded, 0)
+        self.assertEqual(event_count, 1)
+
+    def test_diagnostics_exports_sanitized_fixture(self) -> None:
+        wechat_exporter.log_evolution_event(
+            self.tmp,
+            "unit",
+            "sample_failure",
+            "warning",
+            detail={
+                "url": "https://mp.weixin.qq.com/s/demo?pass_ticket=secret-ticket&key=secret-key",
+                "cookie": "secret-cookie",
+            },
+        )
+        fixture = self.tmp / "diagnostics" / "fixture.json"
+        payload = self.run_cli("wechat-collection-diagnostics", "--export-fixture", str(fixture))
+
+        self.assertTrue(payload["ok"])
+        self.assertTrue(fixture.exists())
+        text = fixture.read_text(encoding="utf-8")
+        self.assertIn("reference_project_checklist", text)
+        for secret in ("secret-ticket", "secret-key", "secret-cookie"):
+            self.assertNotIn(secret, text)
+
+    def test_exporter_wizard_waiting_collection_resume_uses_existing_run(self) -> None:
+        self.run_cli("exporter-import-fixture", str(FIXTURE))
+        account_id = self.fixture_account_id()
+        article = self.run_cli("exporter-articles", "--account-id", str(account_id), "--limit", "1")["articles"][0]
+        self.assertTrue(
+            wechat_exporter.resolve_article_context(
+                self.tmp, int(article["id"]), "var comment_id = '12345';", biz="biz-wizard"
+            )["ok"]
+        )
+        created = wechat_exporter.create_engagement_run(self.tmp, account_id, 1)
+        session_id = "wiz_contract_waiting"
+        request = {
+            "target": "下载哥飞最新1篇，需要评论和互动数据",
+            "account_query": "哥飞",
+            "download": True,
+            "latest": 1,
+            "limit": 1,
+            "output_dir": "",
+            "no_assets": False,
+            "engagement_mode": "elected",
+        }
+        result = {
+            "ok": True,
+            "state": "waiting_wechat_collection",
+            "session_id": session_id,
+            "selected_article_ids": [int(article["id"])],
+            "engagement": {"run_id": created["run_id"], "biz": "biz-wizard", "status": "waiting_credential"},
+        }
+        wechat_exporter.save_wizard_session(
+            self.tmp,
+            session_id,
+            request["target"],
+            "waiting_wechat_collection",
+            request,
+            selected_account_id=account_id,
+            selected_article_ids=[int(article["id"])],
+            result=result,
+        )
+        context_dir = self.tmp / "context"
+        context_dir.mkdir(parents=True, exist_ok=True)
+        (context_dir / "active-proxy-session.json").write_text(json.dumps({"session_id": "proxy-enhancer-test"}), encoding="utf-8")
+        wechat_exporter.credential_capability_path(self.tmp, "proxy-enhancer-test").write_text("capability-test\n", encoding="utf-8")
+        original = wechat_exporter.broker_request
+
+        def fake_broker_request(_socket: Path, payload: dict, timeout_seconds: float) -> dict:
+            self.assertEqual(timeout_seconds, 180)
+            self.assertEqual(payload["biz"], "biz-wizard")
+            return {
+                "ok": True,
+                "articles": [
+                    {
+                        "ok": True,
+                        "article_id": article["id"],
+                        "metrics": {"read_count": 42},
+                        "comments": [],
+                        "comments_complete": True,
+                    }
+                ],
+            }
+
+        try:
+            wechat_exporter.broker_request = fake_broker_request
+            resumed = wechat_exporter.resume_wizard_wechat_collection(self.tmp, session_id, wechat_exporter.load_wizard_session(self.tmp, session_id), request)
+        finally:
+            wechat_exporter.broker_request = original
+
+        self.assertTrue(resumed["ok"])
+        self.assertEqual(resumed["state"], "done")
+        self.assertEqual(resumed["resumed_from"], "waiting_wechat_collection")
         db = sqlite3.connect(self.tmp / "exporter.sqlite")
         try:
             runs = db.execute("SELECT run_id, status FROM engagement_runs").fetchall()

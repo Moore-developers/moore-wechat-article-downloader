@@ -60,6 +60,8 @@ ALLOWED_ASSET_HOST_SUFFIXES = (
 )
 SENSITIVE_QUERY_KEYS = {
     "appmsg_token",
+    "auth-key",
+    "auth_key",
     "cookie",
     "exportkey",
     "key",
@@ -321,7 +323,17 @@ def clean_url(url: str) -> str:
 
 def is_sensitive_key(key: str) -> bool:
     lowered = key.lower()
-    return lowered in SENSITIVE_QUERY_KEYS or "token" in lowered or "ticket" in lowered or lowered in {"cookie", "key"}
+    normalized = re.sub(r"[^a-z0-9]+", "_", lowered).strip("_")
+    return (
+        lowered in SENSITIVE_QUERY_KEYS
+        or normalized in SENSITIVE_QUERY_KEYS
+        or "token" in lowered
+        or "token" in normalized
+        or "ticket" in lowered
+        or "ticket" in normalized
+        or lowered in {"cookie", "key"}
+        or normalized in {"cookie", "key", "auth_key", "appmsg_token", "pass_ticket", "sessionid"}
+    )
 
 
 def sanitize_text_urls(value: str) -> str:

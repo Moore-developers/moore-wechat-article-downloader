@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import shutil
+import socket
 import sys
 import tempfile
 import unittest
@@ -12,7 +13,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
-from wechat_credential_broker import WeChatCredentialBroker, broker_status, credential_socket_path  # noqa: E402
+from wechat_credential_broker import EngagementRequestError, WeChatCredentialBroker, broker_status, credential_socket_path  # noqa: E402
 
 
 class CredentialBrokerTests(unittest.TestCase):
@@ -117,6 +118,33 @@ class CredentialBrokerTests(unittest.TestCase):
         self.assertFalse(rejected["articles"][0]["ok"])
         self.assertEqual(len(calls), 2)
 
+    def test_fetch_engagement_reports_safe_diagnostic_errors(self) -> None:
+        def oversized_get(_url: str, _headers: dict[str, str]) -> str:
+            raise EngagementRequestError("wechat_response_too_large")
+
+        def invalid_comment_get(url: str, _headers: dict[str, str]) -> str:
+            if "/mp/appmsg_comment" in url:
+                return "{"
+            return "var appmsg_read_num = '12';"
+
+        article = {"article_id": 7, "msgid": "msg-7", "idx": 1, "comment_id": "comment-7", "url": "https://mp.weixin.qq.com/s/demo"}
+        oversized = WeChatCredentialBroker(self.tmp / "oversized.sock", "session", "capability-test", http_get=oversized_get)
+        invalid_json = WeChatCredentialBroker(self.tmp / "invalid-json.sock", "session", "capability-test", http_get=invalid_comment_get)
+        for broker in (oversized, invalid_json):
+            broker.capture(
+                "https://mp.weixin.qq.com/s/demo?__biz=MzDemo&uin=12&key=key-secret&pass_ticket=ticket-secret&appmsg_token=token-secret",
+                {"cookie": "wap_sid2=cookie-secret"},
+            )
+
+        oversized_result = oversized.fetch_engagement("MzDemo", [article])
+        invalid_json_result = invalid_json.fetch_engagement("MzDemo", [article])
+
+        self.assertEqual(oversized_result["articles"][0]["error"], "wechat_response_too_large")
+        self.assertEqual(invalid_json_result["articles"][0]["error"], "comment_json_decode_error")
+        serialized = str([oversized_result, invalid_json_result])
+        for value in ("key-secret", "ticket-secret", "token-secret", "cookie-secret"):
+            self.assertNotIn(value, serialized)
+
     def test_short_socket_path_supports_long_runtime_directory(self) -> None:
         long_base = self.tmp / ("nested-" * 25)
         path = credential_socket_path(long_base, "proxy-enhancer-" + "x" * 48)
@@ -127,6 +155,20 @@ class CredentialBrokerTests(unittest.TestCase):
             self.assertTrue(path.exists())
         finally:
             broker.close()
+
+    def test_client_disconnect_does_not_stop_broker_thread(self) -> None:
+        path = self.tmp / "disconnect.sock"
+        broker = WeChatCredentialBroker(path, "session", "capability-test")
+        broker.start()
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.connect(str(path))
+                client.sendall(b'{"op":"status"}')
+            status = broker_status(path)
+        finally:
+            broker.close()
+
+        self.assertTrue(status["ok"])
 
 
 if __name__ == "__main__":

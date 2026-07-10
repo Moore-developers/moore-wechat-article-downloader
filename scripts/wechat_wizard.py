@@ -58,6 +58,7 @@ DOWNLOAD_WORDS = ("下载", "保存", "导出")
 EXPORTER_WORDS = ("exporter", "公众号", "同步", "搜索")
 SYNC_WORDS = ("同步", "刷新", "更新")
 LIST_WORDS = ("列出", "列表", "让我选", "有哪些", "最近")
+ENGAGEMENT_WORDS = ("评论", "互动", "阅读", "阅读数", "点赞", "分享", "精选留言", "精选评论", "在看", "收藏数")
 SENSITIVE_TEXT_RE = re.compile(r"\b(auth-key|pass_ticket|appmsg_token|sessionid|token|cookie|uin|key)=\S+", re.I)
 DEFAULT_DOWNLOAD_PREFERENCES = {
     "output_dir": "",
@@ -658,6 +659,7 @@ def parse_intent(goal: str) -> dict[str, Any]:
     has_exporter_words = any(word.lower() in text.lower() for word in EXPORTER_WORDS)
     has_sync_words = any(word in text for word in SYNC_WORDS)
     has_list_words = any(word in text for word in LIST_WORDS)
+    has_engagement_words = any(word in text for word in ENGAGEMENT_WORDS)
     account_query = extract_account_query(text, urls) if has_download_words or has_exporter_words or has_sync_words or has_list_words else ""
     latest = None
     for marker in ("最新", "最近", "前"):
@@ -676,6 +678,7 @@ def parse_intent(goal: str) -> dict[str, Any]:
         "selection": "",
         "output_dir": "",
         "requires_user_choice": False,
+        "requires_engagement": has_engagement_words,
         "goal": text,
         "input_digest": goal_digest(text),
         "signals": {
@@ -684,6 +687,7 @@ def parse_intent(goal: str) -> dict[str, Any]:
             "has_exporter_words": has_exporter_words,
             "has_sync_words": has_sync_words,
             "has_list_words": has_list_words,
+            "has_engagement_words": has_engagement_words,
             "has_account_query": bool(account_query),
             "url_count": len(urls),
         },
@@ -1691,7 +1695,14 @@ def run_exporter_mode(base: Path, task_id: str, intent: dict[str, Any], output_d
         return result
 
     nickname = account.get("nickname", "") if not output_dir_arg else ""
-    downloaded = wechat_exporter.download_articles(base, selected_ids, output_dir_arg, no_assets, nickname)
+    downloaded = wechat_exporter.download_articles(
+        base,
+        selected_ids,
+        output_dir_arg,
+        no_assets,
+        nickname,
+        force=True,
+    )
     result = {
         "ok": downloaded.get("ok", False),
         "state": "done" if downloaded.get("ok") else "failed_recoverable",
@@ -1701,6 +1712,16 @@ def run_exporter_mode(base: Path, task_id: str, intent: dict[str, Any], output_d
         "selected_article_ids": selected_ids,
         "download": downloaded,
     }
+    if downloaded.get("ok") and intent.get("requires_engagement"):
+        engagement = wechat_exporter.sync_engagement(base, account_id, len(selected_ids))
+        result["engagement"] = engagement
+        if engagement.get("status") == "waiting_credential":
+            result["state"] = "waiting_wechat_collection"
+            result["ok"] = True
+            result["next_step"] = engagement.get("next_step") or "已复制代表文章链接，请粘贴到微信客户端并打开；打开后回复“已打开”。"
+        else:
+            result["state"] = "done" if engagement.get("ok") else "failed_recoverable"
+            result["ok"] = bool(engagement.get("ok"))
     record_gate(base, task_id, "verify", result["state"], bool(downloaded.get("ok")), downloaded)
     save_task(base, task_id, intent, result["state"], "exporter", downloaded.get("output_dir", ""), result)
     return result
@@ -1924,7 +1945,14 @@ def resume_article_choice(
         save_task(base, task_id, task["intent"], "ready", "exporter", result=result)
         return result
     nickname = str(account.get("nickname", "")) if not output_dir else ""
-    downloaded = wechat_exporter.download_articles(base, selected_ids, output_dir, no_assets, nickname)
+    downloaded = wechat_exporter.download_articles(
+        base,
+        selected_ids,
+        output_dir,
+        no_assets,
+        nickname,
+        force=True,
+    )
     state = "done" if downloaded.get("ok") else "failed_recoverable"
     manifest = exporter_download_manifest(base, selected_ids, downloaded)
     record_download_manifest(base, task_id, "exporter", manifest, state)
@@ -1938,8 +1966,47 @@ def resume_article_choice(
         "selected_article_ids": selected_ids,
         "download": downloaded,
     }
+    if downloaded.get("ok") and (task.get("intent") or {}).get("requires_engagement"):
+        engagement = wechat_exporter.sync_engagement(base, account_id, len(selected_ids))
+        result["engagement"] = engagement
+        if engagement.get("status") == "waiting_credential":
+            state = "waiting_wechat_collection"
+            result["state"] = state
+            result["ok"] = True
+            result["next_step"] = engagement.get("next_step") or "已复制代表文章链接，请粘贴到微信客户端并打开；打开后回复“已打开”。"
+        else:
+            state = "done" if engagement.get("ok") else "failed_recoverable"
+            result["state"] = state
+            result["ok"] = bool(engagement.get("ok"))
     record_gate(base, task_id, "verify", state, bool(downloaded.get("ok")), downloaded)
     save_task(base, task_id, task["intent"], state, "exporter", downloaded.get("output_dir", ""), result)
+    return result
+
+
+def resume_wechat_collection(base: Path, task_id: str, task: dict[str, Any]) -> dict[str, Any]:
+    previous = dict(task.get("result") or {})
+    engagement = dict(previous.get("engagement") or {})
+    run_id = str(engagement.get("run_id") or "")
+    biz = str((engagement.get("biz") or "") or "")
+    if not biz and run_id:
+        run, _contexts = wechat_exporter.contexts_for_engagement_run(base, run_id)
+        if run:
+            scope = wechat_exporter.load_json_text(str(run.get("scope_json") or "{}")) or {}
+            biz = str(scope.get("biz") or "")
+    resumed = wechat_exporter.resume_waiting_engagement_runs(base, biz, run_id)
+    state = "done" if resumed.get("ok") else "waiting_wechat_collection"
+    result = {
+        **previous,
+        "ok": bool(resumed.get("ok")),
+        "state": state,
+        "task_id": task_id,
+        "mode": "exporter",
+        "resumed_from": "waiting_wechat_collection",
+        "engagement_resume": resumed,
+    }
+    if not resumed.get("ok"):
+        result["next_step"] = "请确认代表文章已在微信客户端打开并加载评论区，然后再次恢复本任务。"
+    save_task(base, task_id, dict(task["intent"]), state, "exporter", str(previous.get("output_dir") or ""), result)
     return result
 
 
@@ -1957,6 +2024,8 @@ def resume_task(args: argparse.Namespace) -> int:
             result = run_exporter_mode(base, args.task_id, dict(task["intent"]), options["output_dir"], options["no_assets"], args.dry_run)
             result["resumed_from"] = "need_login"
             save_task(base, args.task_id, dict(task["intent"]), str(result.get("state") or "need_login"), "exporter", str(result.get("output_dir") or ""), result)
+        elif state == "waiting_wechat_collection":
+            result = resume_wechat_collection(base, args.task_id, task)
         else:
             result = {
                 "ok": False,

@@ -31,6 +31,15 @@ METRIC_FIELDS = ("read_count", "like_count", "old_like_count", "share_count", "c
 MAX_ARTICLES_PER_REQUEST = 10
 MAX_COMMENT_PAGES = 3
 MAX_COMMENT_ROWS_PER_ARTICLE = 300
+MAX_WECHAT_RESPONSE_BYTES = 6 * 1024 * 1024
+
+
+class EngagementRequestError(RuntimeError):
+    """Safe, non-secret error code for a failed engagement request."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
 
 
 def credential_socket_path(base: Path, session_id: str) -> Path:
@@ -209,6 +218,10 @@ class WeChatCredentialBroker:
             return {"ok": False, "article_id": article_id, "error": f"network_error_{reason}"}
         except TimeoutError:
             return {"ok": False, "article_id": article_id, "error": "timeout"}
+        except EngagementRequestError as exc:
+            return {"ok": False, "article_id": article_id, "error": exc.code}
+        except json.JSONDecodeError:
+            return {"ok": False, "article_id": article_id, "error": "comment_json_decode_error"}
         except Exception:
             return {"ok": False, "article_id": article_id, "error": "engagement_request_failed"}
 
@@ -240,8 +253,12 @@ class WeChatCredentialBroker:
                 request_params["buffer"] = buffer
             text = self._http_get("https://mp.weixin.qq.com/mp/appmsg_comment?" + urllib.parse.urlencode(request_params), headers)
             payload = json.loads(text)
-            if not isinstance(payload, dict) or int((payload.get("base_resp") or {}).get("ret") or 0) != 0:
-                raise RuntimeError("comment endpoint rejected request")
+            if not isinstance(payload, dict):
+                raise EngagementRequestError("comment_response_shape_error")
+            base_resp = payload.get("base_resp") if isinstance(payload.get("base_resp"), dict) else {}
+            ret = int(base_resp.get("ret") or 0)
+            if ret != 0:
+                raise EngagementRequestError(f"comment_endpoint_ret_{ret}")
             rows = payload.get("elected_comment") if isinstance(payload, dict) else []
             if not isinstance(rows, list):
                 rows = []
@@ -320,9 +337,9 @@ class WeChatCredentialBroker:
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
         with opener.open(request, timeout=12) as response:
             charset = response.headers.get_content_charset() or "utf-8"
-            body = response.read(1024 * 1024 + 1)
-            if len(body) > 1024 * 1024:
-                raise RuntimeError("wechat response exceeds local safety limit")
+            body = response.read(MAX_WECHAT_RESPONSE_BYTES + 1)
+            if len(body) > MAX_WECHAT_RESPONSE_BYTES:
+                raise EngagementRequestError("wechat_response_too_large")
             return body.decode(charset, errors="replace")
 
     @staticmethod
@@ -367,7 +384,10 @@ class WeChatCredentialBroker:
                         response = {"ok": False, "error": "unsupported operation"}
                 except Exception:
                     response = {"ok": False, "error": "invalid broker request"}
-                client.sendall(json.dumps(response, ensure_ascii=True, sort_keys=True).encode("utf-8"))
+                try:
+                    client.sendall(json.dumps(response, ensure_ascii=True, sort_keys=True).encode("utf-8"))
+                except (BrokenPipeError, ConnectionResetError, socket.timeout, OSError):
+                    continue
 
     @staticmethod
     def _recv_all(client: socket.socket) -> bytes:
