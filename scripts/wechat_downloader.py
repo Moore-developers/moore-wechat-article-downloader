@@ -37,6 +37,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
+from wechat_credential_broker import broker_status
+
 
 APP_DIR = Path.home() / ".moore" / "wechat-article-downloader"
 DEFAULT_DELIVERY_DIR = Path.home() / "Downloads" / "wechat-articles"
@@ -2411,6 +2413,13 @@ def status_proxy_enhancer(base: Path, port: int | None = None) -> dict[str, Any]
             "next_step": "Run proxy-enhancer-session-start to create a new random-port session.",
         }
     status = status_proxy_service(base, selected_port)
+    active = read_active_proxy_session(base)
+    session_id = str(active.get("session_id") or "")
+    credential_status = broker_status(base / "context" / f"{session_id}.credential.sock") if session_id else {
+        "ok": False,
+        "status": "unavailable",
+        "error": "no active collection session",
+    }
     latest = latest_auto_snapshot(base)
     debug_log = auto_snapshot_root(base) / "debug.jsonl"
     return {
@@ -2420,6 +2429,7 @@ def status_proxy_enhancer(base: Path, port: int | None = None) -> dict[str, Any]
         "snapshot_index": str(auto_snapshot_index_path(base)),
         "debug_log": str(debug_log),
         "latest_snapshot": latest if latest else {},
+        "credential_status": credential_status,
         "next_step": (
             "If WeChat is already routed to this proxy, open an article and click 收藏到本地."
             if status.get("running")

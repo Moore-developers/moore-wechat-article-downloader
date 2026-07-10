@@ -21,6 +21,8 @@ import urllib.parse
 from pathlib import Path
 from typing import Any
 
+from wechat_credential_broker import WeChatCredentialBroker
+
 
 HISTORY_FIELDS = [
     "account_name",
@@ -960,6 +962,7 @@ class WeChatHistoryCapture:
         self.base = Path(runtime_dir).expanduser()
         self.fallback_session_id = session_id
         self.active_session_path = self.base / "context" / "active-proxy-session.json"
+        self.credential_broker: WeChatCredentialBroker | None = None
 
     def active_session_id(self) -> str:
         if self.active_session_path.exists():
@@ -1041,6 +1044,25 @@ class WeChatHistoryCapture:
                 del request.headers[header]
         request.headers["cache-control"] = "no-cache"
         request.headers["pragma"] = "no-cache"
+
+    def ensure_credential_broker(self, context: dict[str, Any]) -> WeChatCredentialBroker | None:
+        if context["session"].get("mode") != "proxy-enhancer":
+            return None
+        if self.credential_broker is None:
+            socket_path = self.base / "context" / f"{context['session_id']}.credential.sock"
+            broker = WeChatCredentialBroker(socket_path, str(context["session_id"]))
+            broker.start()
+            self.credential_broker = broker
+        return self.credential_broker
+
+    def capture_credential(self, flow: Any, context: dict[str, Any]) -> None:
+        request = flow.request
+        content_type = flow.response.headers.get("content-type", "") if flow.response else ""
+        if not is_article_page(request.host, request.path, content_type):
+            return
+        broker = self.ensure_credential_broker(context)
+        if broker:
+            broker.capture(request.url, request.headers, flow.response.headers if flow.response else None)
 
     def observe(self, flow: Any, markers: list[str], rows_count: int = 0, observe_path: Path | None = None) -> None:
         request = flow.request
@@ -1143,6 +1165,7 @@ class WeChatHistoryCapture:
             return
         session = context["session"]
         if session.get("mode") == "proxy-enhancer":
+            self.capture_credential(flow, context)
             self._enhancer_response(flow, context)
             return
         if session.get("mode") == "proxy-snapshot":
