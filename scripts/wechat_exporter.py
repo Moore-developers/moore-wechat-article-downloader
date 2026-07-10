@@ -3382,6 +3382,7 @@ def parse_wizard_request(args: argparse.Namespace) -> dict[str, Any]:
     wants_list = args.list_only or bool(re.search(r"列出|有哪些|让我选|先看|列表", text))
     wants_sync = args.sync_only
     wants_download = not wants_list and not args.sync_only
+    wants_engagement = bool(re.search(r"评论|互动|阅读数|点赞|在看|精选留言|精选评论", text))
     return {
         "target": text,
         "account_query": query,
@@ -3396,7 +3397,43 @@ def parse_wizard_request(args: argparse.Namespace) -> dict[str, Any]:
         "no_assets": args.no_assets,
         "profile": args.profile,
         "auto_add": args.auto_add,
+        "engagement_mode": "elected" if wants_engagement else "none",
     }
+
+
+def wizard_login_required(base: Path, session_id: str, request: dict[str, Any], account: dict[str, Any] | None, error: str = "") -> dict[str, Any]:
+    """Create or reuse a QR artifact so login is visible in the task result."""
+    try:
+        existing = load_wizard_session(base, session_id).get("result", {}) if session_id else {}
+    except RuntimeError:
+        existing = {}
+    login_id = str(existing.get("login_id") or "") if isinstance(existing, dict) else ""
+    login: dict[str, Any]
+    try:
+        if login_id:
+            previous = load_qr_login_session(base, login_id)
+            if str(previous.get("status")) == "waiting_for_scan":
+                login = {"login_id": login_id, "qrcode_path": previous.get("qrcode_path", ""), "expires_at": previous.get("expires_at", "")}
+            else:
+                login = start_qr_login(base, str(request.get("base_url") or ""))
+        else:
+            login = start_qr_login(base, str(request.get("base_url") or ""))
+    except Exception as exc:
+        return {"ok": False, "state": "need_login", "session_id": session_id, "error": str(exc) or error}
+    qrcode_path = str(login.get("qrcode_path") or "")
+    result = {
+        "ok": False,
+        "state": "need_login",
+        "session_id": session_id,
+        "account": slim_account(account) if account else {},
+        "login_id": str(login.get("login_id") or login_id),
+        "expires_at": str(login.get("expires_at") or ""),
+        "artifacts": [{"type": "image", "path": qrcode_path, "alt": "微信扫码登录"}] if qrcode_path else [],
+        "error": error,
+        "next_step": "请扫描结果中的二维码并确认登录；确认后恢复同一任务。",
+    }
+    save_wizard_session(base, session_id, str(request.get("target") or ""), "need_login", request, selected_account_id=int(account.get("id") or 0) if account else 0, result=result)
+    return result
 
 
 def slim_account(account: dict[str, Any]) -> dict[str, Any]:
@@ -3589,15 +3626,7 @@ def run_wizard_after_account(
                 str(request.get("profile") or ""),
             )
             if not synced.get("ok") and (request.get("sync_only") or not existing or fresh_download or stale_cache):
-                save_wizard_session(base, session_id, str(request.get("target") or ""), "need_login", request, selected_account_id=account_id, result=synced)
-                return {
-                    "ok": False,
-                    "state": "need_login",
-                    "session_id": session_id,
-                    "account": slim_account(account),
-                    "error": "; ".join(synced.get("errors") or []) or "sync failed",
-                    "next_step": "先完成 exporter 扫码登录，再用 exporter-wizard --resume 继续。",
-                }
+                return wizard_login_required(base, session_id, request, account, "; ".join(synced.get("errors") or []) or "sync failed")
     if request.get("sync_only"):
         result = {
             "ok": True,
@@ -3652,16 +3681,22 @@ def run_wizard_after_account(
         return result
 
     downloaded = download_articles(base, selected_ids, str(request.get("output_dir") or ""), bool(request.get("no_assets")))
+    engagement = None
+    state = "done"
+    if request.get("engagement_mode") == "elected" and downloaded.get("ok"):
+        engagement = sync_engagement(base, account_id, len(selected_ids))
+        state = "waiting_wechat_credential" if engagement.get("status") == "waiting_credential" else "done"
     result = {
         "ok": downloaded.get("ok", False),
-        "state": "done",
+        "state": state,
         "session_id": session_id,
         "account": slim_account(dict(get_account_row(base, account_id=account_id))),
         "sync": synced,
         "selected_article_ids": selected_ids,
         "download": downloaded,
+        "engagement": engagement,
     }
-    save_wizard_session(base, session_id, str(request.get("target") or ""), "done", request, selected_account_id=account_id, selected_article_ids=selected_ids, result=result)
+    save_wizard_session(base, session_id, str(request.get("target") or ""), state, request, selected_account_id=account_id, selected_article_ids=selected_ids, result=result)
     return result
 
 
@@ -3672,6 +3707,21 @@ def command_wizard(args: argparse.Namespace) -> int:
         session = load_wizard_session(base, args.resume)
         request = dict(session.get("request") or {})
         session_id = args.resume
+        if session.get("state") == "need_login":
+            login_id = str((session.get("result") or {}).get("login_id") or "")
+            if login_id:
+                try:
+                    login_status = qr_login_status(base, login_id)
+                    if login_status.get("ready_to_complete"):
+                        complete_qr_login(base, login_id, str(request.get("profile") or ""))
+                    else:
+                        result = {**dict(session.get("result") or {}), "login_status": login_status}
+                        write_json_response(scrub_payload(result))
+                        return 1
+                except Exception as exc:
+                    result = wizard_login_required(base, session_id, request, None, str(exc))
+                    write_json_response(scrub_payload(result))
+                    return 1
         if args.latest is not None:
             request["latest"] = args.latest
         if args.limit:
@@ -3713,15 +3763,7 @@ def command_wizard(args: argparse.Namespace) -> int:
                     write_json_response(scrub_payload(result))
                     return 0
                 else:
-                    result = {
-                        "ok": False,
-                        "state": state,
-                        "session_id": session_id,
-                        "target": request.get("target", ""),
-                        "error": resolved.get("error", ""),
-                        "next_step": "先运行 exporter-login-qr-start 完成扫码登录；如果已有 auth-key，用 exporter-config 保存。",
-                    }
-                    save_wizard_session(base, session_id, str(request.get("target") or ""), state, request, result=result)
+                    result = wizard_login_required(base, session_id, request, None, str(resolved.get("error") or ""))
                     write_json_response(scrub_payload(result))
                     return 1
         if args.article_ids:
@@ -3752,15 +3794,11 @@ def command_wizard(args: argparse.Namespace) -> int:
         save_wizard_session(base, session_id, request["target"], state, request, candidates, result=result)
         write_json_response(scrub_payload(result))
         return 0
-    result = {
-        "ok": False,
-        "state": state,
-        "session_id": session_id,
-        "target": request["target"],
-        "error": resolved.get("error", ""),
-        "next_step": "先运行 exporter-login-qr-start 完成扫码登录；如果已有 auth-key，用 exporter-config 保存。",
+    result = wizard_login_required(base, session_id, request, None, str(resolved.get("error") or "")) if state == "need_login" else {
+        "ok": False, "state": state, "session_id": session_id, "target": request["target"], "error": resolved.get("error", "")
     }
-    save_wizard_session(base, session_id, request["target"], state, request, result=result)
+    if state != "need_login":
+        save_wizard_session(base, session_id, request["target"], state, request, result=result)
     write_json_response(scrub_payload(result))
     return 1
 
