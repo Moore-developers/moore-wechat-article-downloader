@@ -744,6 +744,35 @@ class WizardContractTests(unittest.TestCase):
         self.assertEqual(payload["mode"], "exporter")
         self.assertEqual(len(payload["selected_article_ids"]), 2)
 
+    def test_exporter_engagement_request_skips_regular_download(self) -> None:
+        self.import_exporter_fixture_synced_today()
+        intent = wechat_wizard.parse_intent("下载「哥飞」最近 2 篇文章的评论和互动数据")
+        wechat_wizard.decide_mode(intent)
+        calls: list[str] = []
+        original_download = wechat_wizard.wechat_exporter.download_articles
+        original_engagement = wechat_wizard.wechat_exporter.sync_engagement_for_articles
+
+        def fail_download(*_args: object, **_kwargs: object) -> dict:
+            calls.append("download")
+            raise AssertionError("regular exporter download must not run for engagement requests")
+
+        def fake_engagement(_base: Path, _account_id: int, article_ids: list[int], **_kwargs: object) -> dict:
+            calls.append("engagement")
+            return {"ok": True, "status": "complete", "article_count": len(article_ids)}
+
+        try:
+            wechat_wizard.wechat_exporter.download_articles = fail_download
+            wechat_wizard.wechat_exporter.sync_engagement_for_articles = fake_engagement
+            result = wechat_wizard.run_exporter_mode(self.tmp, "task_engagement", intent, "", False, False)
+        finally:
+            wechat_wizard.wechat_exporter.download_articles = original_download
+            wechat_wizard.wechat_exporter.sync_engagement_for_articles = original_engagement
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["flow"], "exporter-sync -> engagement batch download")
+        self.assertIsNone(result["download"])
+        self.assertEqual(calls, ["engagement"])
+
     def test_exporter_stale_cache_requires_login_before_sync(self) -> None:
         data = json.loads(FIXTURE.read_text(encoding="utf-8"))
         account = wechat_exporter.upsert_account(self.tmp, wechat_exporter.normalize_account(data["account"]))["account"]

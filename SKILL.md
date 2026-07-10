@@ -58,6 +58,14 @@ python3 {baseDir}/scripts/wechat_wizard.py retry "<task-id>"
 
 **边界**：Exporter 模式只做公众号搜索、历史文章同步和文章下载；不获取评论、阅读数、点赞数、收藏数、转发数等互动数据。互动数据只在代理快照模式验证通过后再提供。
 
+**带评论/互动数据的硬规则**：
+
+- 普通下载：`exporter-sync -> exporter-download`，只用于不带评论/互动数据的正文下载。
+- 带评论互动下载：`exporter-sync -> engagement batch download`。
+- 当用户需求包含“评论 / 互动 / 阅读数 / 点赞 / 在看 / 精选评论”时，禁止先调用普通 `exporter-download`。
+- 此时 Exporter 只负责同步文章列表、标题、日期和 URL；正文与互动数据由 `wechat-collection-sync-engagement` / wizard 的 engagement 批量任务处理。
+- 文章落盘只发生一次：成功拿到互动数据后生成最终 Markdown；如果某篇互动失败，再降级写正文并标记“互动数据缺失”。
+
 ```bash
 python3 {baseDir}/scripts/wechat_wizard.py run "获取公众号「<名称>」的历史文章"
 ```
@@ -98,6 +106,12 @@ python3 {baseDir}/scripts/wechat_wizard.py run "代理历史：<sample-article-u
 
 此模式保存用户当前浏览的文章，也可在短时凭证有效期内恢复同公众号已授权任务的互动同步。历史列表仍默认走 Exporter；旧代理历史列表只作为备用。只同步精选评论，不承诺全量评论或完整回复树。
 
+批量互动任务必须使用已经同步出的文章列表和 URL 创建，不要先用普通 Exporter 下载正文。用户说“下载某公众号最新 N 篇文章的评论和互动数据”时，正确链路是：
+
+```text
+exporter-sync -> engagement batch download
+```
+
 主流程不再使用 `proxy-snapshot-prepare --yes`。
 
 每次新会话从 `23032-24045` 选择一个空闲随机端口。启动前先固定当前 upstream，再启动增强代理并切换系统 HTTP/HTTPS 代理。端口、PID、upstream 和恢复状态写入活动会话；同一会话安全重载时必须复用这些值。
@@ -111,13 +125,13 @@ python3 {baseDir}/scripts/wechat_wizard.py run "代理历史：<sample-article-u
 启动命令：
 
 ```bash
-python3 {baseDir}/scripts/wechat_downloader.py proxy-enhancer-session-start --upstream-proxy auto --yes
+python3 {baseDir}/scripts/wechat_downloader.py proxy-enhancer-session-start --upstream-proxy none --yes
 ```
 
 如果修改了代理增强代码或需要重载，只能使用安全重载。该命令自动读取并复用活动端口与 upstream：
 
 ```bash
-python3 {baseDir}/scripts/wechat_downloader.py proxy-enhancer-restart --upstream-proxy auto --yes
+python3 {baseDir}/scripts/wechat_downloader.py proxy-enhancer-restart --upstream-proxy none --yes
 ```
 
 不要在系统代理指向活动端口时直接 `kill`、`proxy-enhancer-stop` 或 `stop && start`；这会让系统代理指向死端口。安全重载会临时恢复上游或直连，使用原端口重启，再切回活动端口。

@@ -1694,6 +1694,26 @@ def run_exporter_mode(base: Path, task_id: str, intent: dict[str, Any], output_d
         save_task(base, task_id, intent, "ready", "exporter", result=result)
         return result
 
+    if intent.get("requires_engagement"):
+        engagement = wechat_exporter.sync_engagement_for_articles(base, account_id, selected_ids, output_root=output_dir_arg)
+        state = "waiting_wechat_collection" if engagement.get("status") == "waiting_credential" else ("done" if engagement.get("ok") else "failed_recoverable")
+        result = {
+            "ok": bool(engagement.get("ok") or engagement.get("status") == "waiting_credential"),
+            "state": state,
+            "task_id": task_id,
+            "mode": "exporter",
+            "account": compact_account(dict(wechat_exporter.get_account_row(base, account_id=account_id))),
+            "selected_article_ids": selected_ids,
+            "download": None,
+            "engagement": engagement,
+            "flow": "exporter-sync -> engagement batch download",
+        }
+        if engagement.get("status") == "waiting_credential":
+            result["next_step"] = engagement.get("next_step") or "已复制代表文章链接，请粘贴到微信客户端并打开；打开后回复“已打开”。"
+        record_gate(base, task_id, "engagement", state, bool(result["ok"]), engagement)
+        save_task(base, task_id, intent, state, "exporter", output_dir_arg, result)
+        return result
+
     nickname = account.get("nickname", "") if not output_dir_arg else ""
     downloaded = wechat_exporter.download_articles(
         base,
@@ -1712,16 +1732,6 @@ def run_exporter_mode(base: Path, task_id: str, intent: dict[str, Any], output_d
         "selected_article_ids": selected_ids,
         "download": downloaded,
     }
-    if downloaded.get("ok") and intent.get("requires_engagement"):
-        engagement = wechat_exporter.sync_engagement(base, account_id, len(selected_ids))
-        result["engagement"] = engagement
-        if engagement.get("status") == "waiting_credential":
-            result["state"] = "waiting_wechat_collection"
-            result["ok"] = True
-            result["next_step"] = engagement.get("next_step") or "已复制代表文章链接，请粘贴到微信客户端并打开；打开后回复“已打开”。"
-        else:
-            result["state"] = "done" if engagement.get("ok") else "failed_recoverable"
-            result["ok"] = bool(engagement.get("ok"))
     record_gate(base, task_id, "verify", result["state"], bool(downloaded.get("ok")), downloaded)
     save_task(base, task_id, intent, result["state"], "exporter", downloaded.get("output_dir", ""), result)
     return result
@@ -1944,6 +1954,28 @@ def resume_article_choice(
         }
         save_task(base, task_id, task["intent"], "ready", "exporter", result=result)
         return result
+
+    if (task.get("intent") or {}).get("requires_engagement"):
+        engagement = wechat_exporter.sync_engagement_for_articles(base, account_id, selected_ids, output_root=output_dir)
+        state = "waiting_wechat_collection" if engagement.get("status") == "waiting_credential" else ("done" if engagement.get("ok") else "failed_recoverable")
+        result = {
+            "ok": bool(engagement.get("ok") or engagement.get("status") == "waiting_credential"),
+            "state": state,
+            "task_id": task_id,
+            "mode": "exporter",
+            "resumed_from": "need_article_choice",
+            "account": account,
+            "selected_article_ids": selected_ids,
+            "download": None,
+            "engagement": engagement,
+            "flow": "exporter-sync -> engagement batch download",
+        }
+        if engagement.get("status") == "waiting_credential":
+            result["next_step"] = engagement.get("next_step") or "已复制代表文章链接，请粘贴到微信客户端并打开；打开后回复“已打开”。"
+        record_gate(base, task_id, "engagement", state, bool(result["ok"]), engagement)
+        save_task(base, task_id, task["intent"], state, "exporter", output_dir, result)
+        return result
+
     nickname = str(account.get("nickname", "")) if not output_dir else ""
     downloaded = wechat_exporter.download_articles(
         base,
@@ -1966,18 +1998,6 @@ def resume_article_choice(
         "selected_article_ids": selected_ids,
         "download": downloaded,
     }
-    if downloaded.get("ok") and (task.get("intent") or {}).get("requires_engagement"):
-        engagement = wechat_exporter.sync_engagement(base, account_id, len(selected_ids))
-        result["engagement"] = engagement
-        if engagement.get("status") == "waiting_credential":
-            state = "waiting_wechat_collection"
-            result["state"] = state
-            result["ok"] = True
-            result["next_step"] = engagement.get("next_step") or "已复制代表文章链接，请粘贴到微信客户端并打开；打开后回复“已打开”。"
-        else:
-            state = "done" if engagement.get("ok") else "failed_recoverable"
-            result["state"] = state
-            result["ok"] = bool(engagement.get("ok"))
     record_gate(base, task_id, "verify", state, bool(downloaded.get("ok")), downloaded)
     save_task(base, task_id, task["intent"], state, "exporter", downloaded.get("output_dir", ""), result)
     return result

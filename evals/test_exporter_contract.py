@@ -416,6 +416,67 @@ class ExporterContractTests(unittest.TestCase):
         finally:
             db.close()
 
+    def test_wizard_engagement_request_skips_regular_download(self) -> None:
+        self.run_cli("exporter-import-fixture", str(FIXTURE))
+        account_id = self.fixture_account_id()
+        self.mark_account_synced_today(account_id)
+        articles = self.run_cli("exporter-articles", "--account-id", str(account_id), "--limit", "2")["articles"]
+        for article in articles:
+            wechat_exporter.resolve_article_context(
+                self.tmp,
+                int(article["id"]),
+                "var comment_id = '12345';",
+                biz="fakeid_gefei_demo",
+            )
+        calls: list[str] = []
+        original_download = wechat_exporter.download_articles
+        original_engagement = wechat_exporter.sync_engagement_for_articles
+        original_sync = wechat_exporter.sync_account_articles
+
+        def fail_download(*_args: object, **_kwargs: object) -> dict:
+            calls.append("download")
+            raise AssertionError("regular exporter download must not run for engagement requests")
+
+        def fake_engagement(_base: Path, _account_id: int, article_ids: list[int], **_kwargs: object) -> dict:
+            calls.append("engagement")
+            return {"ok": True, "status": "complete", "article_count": len(article_ids)}
+
+        def fake_sync(_base: Path, _account_id: int, _limit: int, _keyword: str = "", _profile: str = "") -> dict:
+            calls.append("sync")
+            return {"ok": True, "fetched_count": 2, "upserted_count": 0}
+
+        try:
+            wechat_exporter.download_articles = fail_download
+            wechat_exporter.sync_engagement_for_articles = fake_engagement
+            wechat_exporter.sync_account_articles = fake_sync
+            result = wechat_exporter.run_wizard_after_account(
+                self.tmp,
+                "wizard-engagement-test",
+                {
+                    "target": "下载「哥飞」最新 2 篇文章的评论和互动数据",
+                    "latest": 2,
+                    "limit": 50,
+                    "keyword": "",
+                    "download": True,
+                    "list_only": False,
+                    "sync_only": False,
+                    "output_dir": "",
+                    "no_assets": False,
+                    "profile": "",
+                    "engagement_mode": "elected",
+                },
+                dict(wechat_exporter.get_account_row(self.tmp, account_id=account_id)),
+            )
+        finally:
+            wechat_exporter.download_articles = original_download
+            wechat_exporter.sync_engagement_for_articles = original_engagement
+            wechat_exporter.sync_account_articles = original_sync
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["flow"], "exporter-sync -> engagement batch download")
+        self.assertIsNone(result["download"])
+        self.assertEqual(calls, ["sync", "engagement"])
+
     def test_wizard_need_login_session_can_resume_without_account_id(self) -> None:
         code, payload = self.run_cli_allow_fail("exporter-wizard", "用 exporter 模式下载公众号「哥飞」最新 20 篇", "--latest", "20")
         self.assertNotEqual(code, 0)

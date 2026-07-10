@@ -2521,6 +2521,40 @@ def ready_engagement_contexts(base: Path, account_id: int, limit: int) -> list[d
         db.close()
 
 
+def selected_engagement_contexts(base: Path, account_id: int, article_ids: list[int]) -> list[dict[str, Any]]:
+    init_exporter_db(base)
+    if not article_ids:
+        return []
+    placeholders = ",".join("?" for _ in article_ids)
+    params: list[Any] = [account_id, *article_ids]
+    db = connect_db(base)
+    try:
+        rows = db.execute(
+            f"""
+            SELECT
+                a.id AS article_id,
+                a.account_id,
+                COALESCE(NULLIF(c.biz, ''), m.biz, '') AS biz,
+                a.msgid,
+                a.idx,
+                COALESCE(NULLIF(c.comment_id, ''), '') AS comment_id,
+                a.url
+            FROM articles a
+            LEFT JOIN article_contexts c ON c.article_id = a.id
+            LEFT JOIN account_biz_mappings m ON m.account_id = a.account_id
+            WHERE a.account_id = ?
+              AND a.id IN ({placeholders})
+              AND COALESCE(NULLIF(c.biz, ''), m.biz, '') <> ''
+              AND a.msgid <> ''
+            """,
+            params,
+        ).fetchall()
+        by_id = {int(row["article_id"]): dict(row) for row in rows}
+        return [by_id[article_id] for article_id in article_ids if article_id in by_id]
+    finally:
+        db.close()
+
+
 def active_collection_broker(base: Path) -> tuple[Path, str] | None:
     active_path = base / "context" / "active-proxy-session.json"
     if not active_path.exists():
@@ -2559,6 +2593,43 @@ def create_engagement_run(base: Path, account_id: int, limit: int = 50) -> dict[
             VALUES (?, ?, ?, 'waiting_credential', ?, ?, ?)
             """,
             (run_id, account_id, json_dumps({"biz": biz, "article_ids": [item["article_id"] for item in contexts]}), len(contexts), now, now),
+        )
+        db.commit()
+    finally:
+        db.close()
+    return {"ok": True, "run_id": run_id, "biz": biz, "contexts": contexts}
+
+
+def create_engagement_run_for_articles(base: Path, account_id: int, article_ids: list[int]) -> dict[str, Any]:
+    selected_ids = [int(value) for value in article_ids if int(value or 0)]
+    if not selected_ids:
+        return {"ok": False, "status": "missing_context", "error": "no articles selected", "article_count": 0}
+    contexts = selected_engagement_contexts(base, account_id, selected_ids)
+    found_ids = {int(item["article_id"]) for item in contexts}
+    missing_ids = [article_id for article_id in selected_ids if article_id not in found_ids]
+    if missing_ids:
+        return {
+            "ok": False,
+            "status": "missing_context",
+            "error": "selected articles are missing engagement context; sync the account again",
+            "article_count": len(contexts),
+            "missing_article_ids": missing_ids,
+        }
+    biz_values = {str(item["biz"]) for item in contexts if item.get("biz")}
+    if len(biz_values) != 1:
+        return {"ok": False, "status": "mapping_conflict", "error": "article contexts do not resolve to one __biz", "article_count": len(contexts)}
+    biz = next(iter(biz_values))
+    now = utc_now()
+    run_id = "engagement-" + make_run_id()
+    db = connect_db(base)
+    try:
+        db.execute(
+            """
+            INSERT INTO engagement_runs
+                (run_id, account_id, scope_json, status, requested_count, created_at, updated_at)
+            VALUES (?, ?, ?, 'waiting_credential', ?, ?, ?)
+            """,
+            (run_id, account_id, json_dumps({"biz": biz, "article_ids": selected_ids}), len(contexts), now, now),
         )
         db.commit()
     finally:
@@ -2753,7 +2824,7 @@ def sync_engagement(
         return created
     collection_session: dict[str, Any] | None = None
     if auto_start_collection and not active_collection_broker(base):
-        collection_session = start_proxy_enhancer_session(base, upstream_proxy="auto", yes=True)
+        collection_session = start_proxy_enhancer_session(base, upstream_proxy="none", yes=True)
         if not collection_session.get("ok"):
             log_evolution_event(
                 base,
@@ -2769,6 +2840,51 @@ def sync_engagement(
     if result.get("status") != "waiting_credential" or not representative_url:
         writeback = (
             write_engagement_to_markdown(base, [int(item["article_id"]) for item in created["contexts"]], output_root)
+            if result.get("status") in {"complete", "partial"}
+            else None
+        )
+        return {**result, "representative_url": representative_url, "collection_session": collection_session, "markdown_writeback": writeback}
+    copied, clipboard_method = copy_to_clipboard(representative_url)
+    return {
+        **result,
+        "representative_url": representative_url,
+        "copied_to_clipboard": copied,
+        "clipboard_method": clipboard_method if copied else "",
+        "clipboard_error": "" if copied else clipboard_method,
+        "collection_session": collection_session,
+        "next_step": "已复制代表文章链接，请粘贴到微信客户端并打开；打开后继续恢复本任务。",
+    }
+
+
+def sync_engagement_for_articles(
+    base: Path,
+    account_id: int,
+    article_ids: list[int],
+    auto_start_collection: bool = True,
+    output_root: str = "",
+) -> dict[str, Any]:
+    created = create_engagement_run_for_articles(base, account_id, article_ids)
+    if not created.get("ok"):
+        return created
+    collection_session: dict[str, Any] | None = None
+    if auto_start_collection and not active_collection_broker(base):
+        collection_session = start_proxy_enhancer_session(base, upstream_proxy="none", yes=True)
+        if not collection_session.get("ok"):
+            log_evolution_event(
+                base,
+                "wechat_collection_start",
+                str(collection_session.get("stage") or collection_session.get("error") or "start_failed"),
+                "error",
+                account_id=account_id,
+                run_id=str(created["run_id"]),
+                detail={"status": collection_session.get("mode") or "", "requires_confirmation": collection_session.get("requires_confirmation", False)},
+            )
+    result = execute_engagement_run(base, str(created["run_id"]))
+    representative_url = str(created["contexts"][0].get("url") or "")
+    selected_ids = [int(item["article_id"]) for item in created["contexts"]]
+    if result.get("status") != "waiting_credential" or not representative_url:
+        writeback = (
+            write_engagement_to_markdown(base, selected_ids, output_root)
             if result.get("status") in {"complete", "partial"}
             else None
         )
@@ -4117,12 +4233,28 @@ def run_wizard_after_account(
         return result
 
     output_root = str(request.get("output_dir") or "")
+    if request.get("engagement_mode") == "elected":
+        engagement = sync_engagement_for_articles(base, account_id, selected_ids, output_root=output_root)
+        state = "waiting_wechat_collection" if engagement.get("status") == "waiting_credential" else ("done" if engagement.get("ok") else "failed_recoverable")
+        result = {
+            "ok": bool(engagement.get("ok") or engagement.get("status") == "waiting_credential"),
+            "state": state,
+            "session_id": session_id,
+            "account": slim_account(dict(get_account_row(base, account_id=account_id))),
+            "sync": synced,
+            "selected_article_ids": selected_ids,
+            "download": None,
+            "engagement": engagement,
+            "flow": "exporter-sync -> engagement batch download",
+        }
+        if engagement.get("status") == "waiting_credential":
+            result["next_step"] = engagement.get("next_step") or "已复制代表文章链接，请粘贴到微信客户端并打开；打开后回复“已打开”。"
+        save_wizard_session(base, session_id, str(request.get("target") or ""), state, request, selected_account_id=account_id, selected_article_ids=selected_ids, result=result)
+        return result
+
     downloaded = download_articles(base, selected_ids, output_root, bool(request.get("no_assets")), force=True)
     engagement = None
     state = "done"
-    if request.get("engagement_mode") == "elected" and downloaded.get("ok"):
-        engagement = sync_engagement(base, account_id, len(selected_ids), output_root=output_root)
-        state = "waiting_wechat_collection" if engagement.get("status") == "waiting_credential" else "done"
     result = {
         "ok": downloaded.get("ok", False),
         "state": state,

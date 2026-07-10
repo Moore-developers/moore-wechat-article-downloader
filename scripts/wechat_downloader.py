@@ -2706,7 +2706,7 @@ def proxy_enhancer_route_help(base: Path, port: int | None = None) -> dict[str, 
             "clash_or_mihomo": clash_processes,
         },
         "recommended_path": (
-            "Run proxy-enhancer-session-start --upstream-proxy auto --yes. "
+            "Run proxy-enhancer-session-start --upstream-proxy none --yes. "
             "This allocates a random port and routes system HTTP/HTTPS through it."
         ),
         "upstream_auto_rule": "Resolve the upstream before changing system proxy settings, then preserve it for the full session.",
@@ -5735,8 +5735,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--port", type=int, default=None, help="Optional override; default preserves the active enhancer port")
     p.add_argument(
         "--upstream-proxy",
-        default="auto",
-        help="Upstream HTTP proxy. Use auto to chain the current macOS HTTP proxy after temporary bypass.",
+        default="none",
+        help="Upstream HTTP proxy. Default none uses direct outbound sockets; use auto to chain the current macOS HTTP proxy after temporary bypass.",
     )
     p.add_argument("--yes", action="store_true", help="Actually restart the local proxy service")
     p.set_defaults(func=command_proxy_enhancer_restart)
@@ -5763,8 +5763,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--port", type=int, default=None, help=f"Optional fixed port for debugging; default selects a free port in {PROXY_PORT_MIN}-{PROXY_PORT_MAX}")
     p.add_argument(
         "--upstream-proxy",
-        default="auto",
-        help="Upstream HTTP proxy. Use auto to chain the current macOS HTTP proxy.",
+        default="none",
+        help="Upstream HTTP proxy. Default none uses direct outbound sockets; use auto to chain the current macOS HTTP proxy.",
     )
     p.add_argument("--yes", action="store_true", help="Actually modify macOS HTTP/HTTPS proxy settings")
     p.set_defaults(func=command_proxy_enhancer_session_start)
