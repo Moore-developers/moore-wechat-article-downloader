@@ -2887,6 +2887,15 @@ def command_comments(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_article_context(args: argparse.Namespace) -> int:
+    html_text = ""
+    if args.html_file:
+        html_text = Path(args.html_file).expanduser().read_text(encoding="utf-8")
+    result = resolve_article_context(runtime_dir(args.runtime_dir), args.article_id, html_text, args.biz, args.source)
+    write_json_response(scrub_payload(result))
+    return 0 if result.get("ok") else 1
+
+
 def normalize_match_text(value: Any) -> str:
     return re.sub(r"\s+", "", str(value or "").lower())
 
@@ -3602,6 +3611,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--article-id", type=int, required=True)
     p.add_argument("--limit", type=int, default=100)
     p.set_defaults(func=command_comments)
+
+    p = sub.add_parser("exporter-article-context")
+    p.add_argument("--runtime-dir", default=argparse.SUPPRESS)
+    p.add_argument("--article-id", type=int, required=True)
+    p.add_argument("--html-file", default="", help="Local article HTML used only to parse non-sensitive context")
+    p.add_argument("--biz", default="", help="Explicit public-account __biz; not a credential")
+    p.add_argument("--source", default="html", choices=["html", "snapshot", "manual"])
+    p.set_defaults(func=command_article_context)
 
     p = sub.add_parser("exporter-wizard")
     p.add_argument("--runtime-dir", default=argparse.SUPPRESS)
