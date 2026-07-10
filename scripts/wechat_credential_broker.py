@@ -11,17 +11,21 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import re
 import socket
 import threading
 import time
 import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 BROKER_TTL_SECONDS = 25 * 60
-MAX_REQUEST_BYTES = 16 * 1024
+MAX_REQUEST_BYTES = 2 * 1024 * 1024
 REQUIRED_FIELDS = ("uin", "key", "pass_ticket", "appmsg_token", "cookie")
+METRIC_FIELDS = ("read_count", "like_count", "old_like_count", "share_count", "comment_count")
 
 
 def utc_now() -> str:
@@ -31,7 +35,13 @@ def utc_now() -> str:
 class WeChatCredentialBroker:
     """Owns raw values in memory and exposes redacted status over a Unix socket."""
 
-    def __init__(self, socket_path: Path, session_id: str, ttl_seconds: int = BROKER_TTL_SECONDS) -> None:
+    def __init__(
+        self,
+        socket_path: Path,
+        session_id: str,
+        ttl_seconds: int = BROKER_TTL_SECONDS,
+        http_get: Callable[[str, dict[str, str]], str] | None = None,
+    ) -> None:
         self.socket_path = Path(socket_path)
         self.session_id = session_id
         self.ttl_seconds = max(60, int(ttl_seconds))
@@ -40,6 +50,7 @@ class WeChatCredentialBroker:
         self._server: socket.socket | None = None
         self._thread: threading.Thread | None = None
         self._closed = threading.Event()
+        self._http_get = http_get or self._default_http_get
 
     def start(self) -> None:
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
@@ -121,6 +132,143 @@ class WeChatCredentialBroker:
                 )
         return {"ok": True, "session_id": self.session_id, "credentials": items}
 
+    def fetch_engagement(self, biz: str, articles: list[dict[str, Any]]) -> dict[str, Any]:
+        """Fetch only elected comments and observable metrics with in-memory credentials."""
+        raw = self._credential_for(biz)
+        if raw is None:
+            return {"ok": False, "status": "waiting_credential", "error": "valid credential is unavailable", "articles": []}
+        selected = [item for item in articles if isinstance(item, dict)][:100]
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(self._fetch_article_engagement, biz, raw, article) for article in selected]
+            results = [future.result() for future in as_completed(futures)]
+        results.sort(key=lambda item: int(item.get("article_id") or 0))
+        return {
+            "ok": all(item.get("ok") for item in results),
+            "status": "complete",
+            "source": "wechat_session_api",
+            "articles": results,
+        }
+
+    def _credential_for(self, biz: str) -> dict[str, str] | None:
+        now_epoch = time.time()
+        with self._lock:
+            self._purge_expired(now_epoch)
+            record = self._credentials.get(biz)
+            raw = dict(record.get("raw", {})) if record else {}
+        return raw if all(raw.get(field) for field in REQUIRED_FIELDS) else None
+
+    def _fetch_article_engagement(self, biz: str, raw: dict[str, str], article: dict[str, Any]) -> dict[str, Any]:
+        article_id = int(article.get("article_id") or 0)
+        msgid = str(article.get("msgid") or "")
+        comment_id = str(article.get("comment_id") or "")
+        url = str(article.get("url") or "")
+        if not article_id or not msgid or not comment_id or not url:
+            return {"ok": False, "article_id": article_id, "error": "article context is incomplete"}
+        headers = {"Cookie": raw["cookie"], "User-Agent": "Mozilla/5.0 MicroMessenger"}
+        try:
+            article_html = self._http_get(self._with_credential_query(url, biz, raw), headers)
+            metrics = self._extract_metrics(article_html)
+            comments, complete = self._fetch_elected_comments(biz, raw, msgid, int(article.get("idx") or 0), comment_id, headers)
+            return {
+                "ok": True,
+                "article_id": article_id,
+                "metrics": metrics,
+                "comments": comments,
+                "comments_complete": complete,
+                "comment_scope": "elected",
+            }
+        except Exception:
+            return {"ok": False, "article_id": article_id, "error": "engagement request failed"}
+
+    def _fetch_elected_comments(
+        self,
+        biz: str,
+        raw: dict[str, str],
+        msgid: str,
+        idx: int,
+        comment_id: str,
+        headers: dict[str, str],
+    ) -> tuple[list[dict[str, Any]], bool]:
+        params = {
+            "action": "getcomment",
+            "__biz": biz,
+            "appmsgid": msgid,
+            "idx": str(idx),
+            "comment_id": comment_id,
+            "limit": "100",
+            **{key: raw[key] for key in ("uin", "key", "pass_ticket", "appmsg_token")},
+        }
+        comments: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        buffer = ""
+        complete = True
+        for _page in range(10):
+            request_params = dict(params)
+            if buffer:
+                request_params["buffer"] = buffer
+            text = self._http_get("https://mp.weixin.qq.com/mp/appmsg_comment?" + urllib.parse.urlencode(request_params), headers)
+            payload = json.loads(text)
+            rows = payload.get("elected_comment") if isinstance(payload, dict) else []
+            if not isinstance(rows, list):
+                rows = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                normalized = {
+                    "comment_id": str(row.get("id") or row.get("comment_id") or ""),
+                    "nick_name": str(row.get("nick_name") or row.get("nickname") or ""),
+                    "content": str(row.get("content") or ""),
+                    "like_count": row.get("like_num") or row.get("like_count") or 0,
+                    "create_time": row.get("create_time") or "",
+                    "comment_scope": "elected",
+                    "complete": 0,
+                }
+                identity = normalized["comment_id"]
+                if identity and identity in seen:
+                    continue
+                if identity:
+                    seen.add(identity)
+                comments.append(normalized)
+            continue_flag = int(payload.get("continue_flag") or 0) if isinstance(payload, dict) else 0
+            buffer = str(payload.get("buffer") or "") if isinstance(payload, dict) else ""
+            if not continue_flag or not buffer:
+                return comments, complete
+        return comments, False
+
+    @staticmethod
+    def _with_credential_query(url: str, biz: str, raw: dict[str, str]) -> str:
+        parsed = urllib.parse.urlsplit(url)
+        query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+        query["__biz"] = [biz]
+        for key in ("uin", "key", "pass_ticket", "appmsg_token"):
+            query[key] = [raw[key]]
+        return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urllib.parse.urlencode(query, doseq=True), ""))
+
+    @staticmethod
+    def _extract_metrics(html_text: str) -> dict[str, int | None]:
+        metrics: dict[str, int | None] = {field: None for field in METRIC_FIELDS}
+        aliases = {
+            "read_count": ("read_num", "appmsg_read_num"),
+            "like_count": ("like_num", "appmsg_like_num"),
+            "old_like_count": ("old_like_num", "appmsg_old_like_num"),
+            "share_count": ("share_count",),
+            "comment_count": ("comment_count",),
+        }
+        for field, keys in aliases.items():
+            for key in keys:
+                match = re.search(rf"[\"']?{re.escape(key)}[\"']?\s*[:=]\s*[\"']?(\d+)", html_text)
+                if match:
+                    metrics[field] = int(match.group(1))
+                    break
+        return metrics
+
+    @staticmethod
+    def _default_http_get(url: str, headers: dict[str, str]) -> str:
+        request = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(request, timeout=20) as response:
+            charset = response.headers.get_content_charset() or "utf-8"
+            return response.read().decode(charset, errors="replace")
+
     @staticmethod
     def _header_value(headers: Any, name: str) -> str:
         if not headers:
@@ -148,15 +296,31 @@ class WeChatCredentialBroker:
             with client:
                 client.settimeout(1)
                 try:
-                    raw = client.recv(MAX_REQUEST_BYTES)
+                    raw = self._recv_all(client)
                     request = json.loads(raw.decode("utf-8")) if raw else {}
-                    if not isinstance(request, dict) or request.get("op") != "status":
-                        response = {"ok": False, "error": "unsupported operation"}
-                    else:
+                    if not isinstance(request, dict):
+                        response = {"ok": False, "error": "invalid broker request"}
+                    elif request.get("op") == "status":
                         response = self.status(str(request.get("biz") or ""))
+                    elif request.get("op") == "fetch_engagement":
+                        response = self.fetch_engagement(str(request.get("biz") or ""), request.get("articles") or [])
+                    else:
+                        response = {"ok": False, "error": "unsupported operation"}
                 except Exception:
                     response = {"ok": False, "error": "invalid broker request"}
                 client.sendall(json.dumps(response, ensure_ascii=True, sort_keys=True).encode("utf-8"))
+
+    @staticmethod
+    def _recv_all(client: socket.socket) -> bytes:
+        chunks: list[bytes] = []
+        total = 0
+        while total <= MAX_REQUEST_BYTES:
+            chunk = client.recv(min(64 * 1024, MAX_REQUEST_BYTES - total + 1))
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+            total += len(chunk)
+        raise ValueError("broker request too large")
 
 
 def broker_status(socket_path: Path, biz: str = "", timeout_seconds: float = 1.0) -> dict[str, Any]:
@@ -164,12 +328,28 @@ def broker_status(socket_path: Path, biz: str = "", timeout_seconds: float = 1.0
     if not socket_path.exists():
         return {"ok": False, "status": "unavailable", "error": "credential broker is not running"}
     try:
+        return broker_request(socket_path, {"op": "status", "biz": biz}, timeout_seconds)
+    except OSError:
+        return {"ok": False, "status": "unavailable", "error": "credential broker is not running"}
+
+
+def broker_request(socket_path: Path, payload: dict[str, Any], timeout_seconds: float = 30.0) -> dict[str, Any]:
+    """Invoke an allowed broker operation without exposing its in-memory credentials."""
+    if not socket_path.exists():
+        return {"ok": False, "status": "unavailable", "error": "credential broker is not running"}
+    try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.settimeout(timeout_seconds)
             client.connect(str(socket_path))
-            client.sendall(json.dumps({"op": "status", "biz": biz}, ensure_ascii=True).encode("utf-8"))
-            raw = client.recv(MAX_REQUEST_BYTES)
-        response = json.loads(raw.decode("utf-8")) if raw else {}
+            client.sendall(json.dumps(payload, ensure_ascii=True).encode("utf-8"))
+            client.shutdown(socket.SHUT_WR)
+            chunks = []
+            while True:
+                chunk = client.recv(64 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        response = json.loads(b"".join(chunks).decode("utf-8")) if chunks else {}
         return response if isinstance(response, dict) else {"ok": False, "error": "invalid broker response"}
     except OSError:
         return {"ok": False, "status": "unavailable", "error": "credential broker is not running"}

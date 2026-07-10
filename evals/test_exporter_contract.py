@@ -542,6 +542,59 @@ class ExporterContractTests(unittest.TestCase):
         )
         self.assertEqual(context, {"biz": "MzIxNTA1MDEwNg==", "comment_id": "12345"})
 
+    def test_wechat_collection_sync_persists_metrics_and_elected_comments(self) -> None:
+        self.run_cli("exporter-import-fixture", str(FIXTURE))
+        account_id = self.fixture_account_id()
+        article = self.run_cli("exporter-articles", "--account-id", str(account_id), "--limit", "1")["articles"][0]
+        context = wechat_exporter.resolve_article_context(
+            self.tmp,
+            int(article["id"]),
+            "var comment_id = '12345';",
+            biz="biz-sync",
+        )
+        self.assertTrue(context["ok"])
+        context_dir = self.tmp / "context"
+        context_dir.mkdir(parents=True, exist_ok=True)
+        (context_dir / "active-proxy-session.json").write_text(json.dumps({"session_id": "proxy-enhancer-test"}), encoding="utf-8")
+        original = wechat_exporter.broker_request
+
+        def fake_broker_request(socket_path: Path, payload: dict, timeout_seconds: float) -> dict:
+            self.assertEqual(socket_path.name, "proxy-enhancer-test.credential.sock")
+            self.assertEqual(payload["op"], "fetch_engagement")
+            self.assertEqual(payload["biz"], "biz-sync")
+            return {
+                "ok": True,
+                "status": "complete",
+                "articles": [
+                    {
+                        "ok": True,
+                        "article_id": article["id"],
+                        "metrics": {"read_count": 20, "like_count": 4, "old_like_count": 2, "share_count": None, "comment_count": 1},
+                        "comments": [{"comment_id": "c-sync", "nick_name": "读者", "content": "有收获", "like_count": 2}],
+                        "comments_complete": True,
+                    }
+                ],
+            }
+
+        try:
+            wechat_exporter.broker_request = fake_broker_request
+            result = wechat_exporter.sync_engagement(self.tmp, account_id, limit=1)
+        finally:
+            wechat_exporter.broker_request = original
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["comment_scope"], "elected")
+        db = sqlite3.connect(self.tmp / "exporter.sqlite")
+        try:
+            metric = db.execute("SELECT read_count, like_count, old_like_count, comment_count FROM article_metrics").fetchone()
+            comment = db.execute("SELECT comment_scope, source, complete FROM article_comments WHERE comment_id = 'c-sync'").fetchone()
+            run = db.execute("SELECT status, success_count, failed_count FROM engagement_runs").fetchone()
+        finally:
+            db.close()
+        self.assertEqual(metric, (20, 4, 2, 1))
+        self.assertEqual(comment, ("elected", "wechat_session_api", 1))
+        self.assertEqual(run, ("complete", 1, 0))
+
     def test_init_additively_upgrades_exporter_v3_database(self) -> None:
         db = sqlite3.connect(self.tmp / "exporter.sqlite")
         try:

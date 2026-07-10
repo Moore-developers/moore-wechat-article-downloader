@@ -51,6 +51,7 @@ from wechat_downloader import (  # noqa: E402
     scrub_payload,
     utc_now,
 )
+from wechat_credential_broker import broker_request  # noqa: E402
 
 
 DEFAULT_BASE_URL = "https://down.mptext.top"
@@ -2147,6 +2148,144 @@ def flush_captured_comments(base: Path) -> dict[str, Any]:
     }
 
 
+def ready_engagement_contexts(base: Path, account_id: int, limit: int) -> list[dict[str, Any]]:
+    init_exporter_db(base)
+    db = connect_db(base)
+    try:
+        rows = db.execute(
+            """
+            SELECT c.article_id, c.account_id, c.biz, c.msgid, c.idx, c.comment_id, c.url
+            FROM article_contexts c
+            JOIN articles a ON a.id = c.article_id
+            WHERE c.account_id = ? AND c.context_status = 'ready'
+            ORDER BY a.publish_time DESC, c.article_id DESC
+            LIMIT ?
+            """,
+            (account_id, max(1, min(int(limit or 50), 100))),
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        db.close()
+
+
+def active_collection_socket(base: Path) -> Path | None:
+    active_path = base / "context" / "active-proxy-session.json"
+    if not active_path.exists():
+        return None
+    try:
+        active = json.loads(active_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    session_id = str(active.get("session_id") or "").strip() if isinstance(active, dict) else ""
+    return base / "context" / f"{session_id}.credential.sock" if session_id else None
+
+
+def sync_engagement(base: Path, account_id: int, limit: int = 50) -> dict[str, Any]:
+    """Ask the in-memory broker for elected comments and persist only its safe output."""
+    contexts = ready_engagement_contexts(base, account_id, limit)
+    if not contexts:
+        return {"ok": False, "status": "missing_context", "error": "no ready article context for this account", "article_count": 0}
+    biz_values = {str(item["biz"]) for item in contexts if item.get("biz")}
+    if len(biz_values) != 1:
+        return {"ok": False, "status": "mapping_conflict", "error": "article contexts do not resolve to one __biz", "article_count": len(contexts)}
+    biz = next(iter(biz_values))
+    now = utc_now()
+    run_id = "engagement-" + make_run_id()
+    db = connect_db(base)
+    try:
+        db.execute(
+            """
+            INSERT INTO engagement_runs
+                (run_id, account_id, scope_json, status, requested_count, created_at, updated_at)
+            VALUES (?, ?, ?, 'waiting_credential', ?, ?, ?)
+            """,
+            (run_id, account_id, json_dumps({"biz": biz, "article_ids": [item["article_id"] for item in contexts]}), len(contexts), now, now),
+        )
+        db.commit()
+    finally:
+        db.close()
+    socket_path = active_collection_socket(base)
+    payload = broker_request(
+        socket_path,
+        {"op": "fetch_engagement", "biz": biz, "articles": contexts},
+        timeout_seconds=600,
+    ) if socket_path else {"ok": False, "status": "unavailable", "error": "credential broker is not running"}
+    if payload.get("status") in {"waiting_credential", "unavailable"} or not payload.get("articles"):
+        error = str(payload.get("error") or "valid credential is unavailable")
+        db = connect_db(base)
+        try:
+            db.execute("UPDATE engagement_runs SET error = ?, updated_at = ? WHERE run_id = ?", (error, utc_now(), run_id))
+            db.commit()
+        finally:
+            db.close()
+        return {"ok": False, "run_id": run_id, "status": "waiting_credential", "article_count": len(contexts), "error": error}
+
+    successes = 0
+    failures = 0
+    db = connect_db(base)
+    try:
+        for item in payload.get("articles", []):
+            article_id = int(item.get("article_id") or 0)
+            if not item.get("ok") or not article_id:
+                failures += 1
+                continue
+            metrics = item.get("metrics") if isinstance(item.get("metrics"), dict) else {}
+            captured_at = utc_now()
+            db.execute(
+                """
+                INSERT INTO article_metrics
+                    (run_id, article_id, source, captured_at, read_count, like_count, old_like_count, share_count, comment_count, raw_json)
+                VALUES (?, ?, 'wechat_session_api', ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id, article_id, source) DO UPDATE SET
+                    captured_at = excluded.captured_at,
+                    read_count = excluded.read_count,
+                    like_count = excluded.like_count,
+                    old_like_count = excluded.old_like_count,
+                    share_count = excluded.share_count,
+                    comment_count = excluded.comment_count,
+                    raw_json = excluded.raw_json
+                """,
+                (
+                    run_id,
+                    article_id,
+                    captured_at,
+                    maybe_int(metrics.get("read_count")),
+                    maybe_int(metrics.get("like_count")),
+                    maybe_int(metrics.get("old_like_count")),
+                    maybe_int(metrics.get("share_count")),
+                    maybe_int(metrics.get("comment_count")),
+                    json_dumps(metrics),
+                ),
+            )
+            for comment in item.get("comments", []):
+                if not isinstance(comment, dict):
+                    continue
+                comment = {**comment, "complete": 1 if item.get("comments_complete") else 0}
+                upsert_comment_row(db, article_id, comment, source="wechat_session_api")
+            successes += 1
+        status = "complete" if failures == 0 else "partial"
+        db.execute(
+            """
+            UPDATE engagement_runs
+            SET status = ?, success_count = ?, failed_count = ?, error = '', updated_at = ?
+            WHERE run_id = ?
+            """,
+            (status, successes, failures, utc_now(), run_id),
+        )
+        db.commit()
+    finally:
+        db.close()
+    return {
+        "ok": failures == 0,
+        "run_id": run_id,
+        "status": "complete" if failures == 0 else "partial",
+        "article_count": len(contexts),
+        "success_count": successes,
+        "failed_count": failures,
+        "comment_scope": "elected",
+    }
+
+
 def list_comments(base: Path, article_id: int, limit: int = 100) -> list[dict[str, Any]]:
     init_exporter_db(base)
     db = connect_db(base)
@@ -2907,6 +3046,12 @@ def command_article_context(args: argparse.Namespace) -> int:
     return 0 if result.get("ok") else 1
 
 
+def command_wechat_collection_sync_engagement(args: argparse.Namespace) -> int:
+    result = sync_engagement(runtime_dir(args.runtime_dir), args.account_id, args.limit)
+    write_json_response(scrub_payload(result))
+    return 0 if result.get("ok") else 1
+
+
 def normalize_match_text(value: Any) -> str:
     return re.sub(r"\s+", "", str(value or "").lower())
 
@@ -3631,6 +3776,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--comment-id", default="", help="Explicit non-sensitive article comment ID")
     p.add_argument("--source", default="html", choices=["html", "snapshot", "manual", "public_html"])
     p.set_defaults(func=command_article_context)
+
+    p = sub.add_parser("wechat-collection-sync-engagement")
+    p.add_argument("--runtime-dir", default=argparse.SUPPRESS)
+    p.add_argument("--account-id", type=int, required=True)
+    p.add_argument("--limit", type=int, default=50)
+    p.set_defaults(func=command_wechat_collection_sync_engagement)
 
     p = sub.add_parser("exporter-wizard")
     p.add_argument("--runtime-dir", default=argparse.SUPPRESS)
