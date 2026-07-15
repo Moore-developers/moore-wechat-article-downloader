@@ -24,6 +24,7 @@ import urllib.parse
 from pathlib import Path
 from typing import Any
 
+from wechat_video_service import download_registered_video, json_response, register_video_payload, video_status
 from wechat_credential_broker import WeChatCredentialBroker, credential_socket_path
 
 
@@ -51,10 +52,15 @@ SENSITIVE_QUERY_KEYS = {
     "wxtoken",
 }
 HISTORY_HOSTS = {"mp.weixin.qq.com", "channels.weixin.qq.com"}
+VIDEO_ENDPOINT_HOSTS = {"mp.weixin.qq.com", "channels.weixin.qq.com", "wxapp.tc.qq.com"}
+VIDEO_REGISTER_PATH = "/__moore_video_register"
+VIDEO_DOWNLOAD_PATH = "/__moore_video_download"
+VIDEO_STATUS_PATH = "/__moore_video_status"
 OBSERVE_HOSTS = {
     "mp.weixin.qq.com",
     "channels.weixin.qq.com",
     "finder.video.qq.com",
+    "res.wx.qq.com",
     "wxa.wxs.qq.com",
     "wxsmw.wxs.qq.com",
     "wximg.wxs.qq.com",
@@ -83,6 +89,103 @@ SENSITIVE_TEXT_RE = re.compile(
 )
 DEBUG_LOG_RETENTION = dt.timedelta(hours=24)
 DEBUG_LOG_PRUNE_INTERVAL = dt.timedelta(hours=12)
+
+
+CHANNELS_VIDEO_SCRIPT = r"""
+<script>
+(function () {
+  if (window.__mooreVideoInstalled) return;
+  window.__mooreVideoInstalled = true;
+  var latestVideoId = '';
+  function buttonStyle() {
+    return [
+      'position:fixed',
+      'right:18px',
+      'bottom:86px',
+      'z-index:2147483647',
+      'height:38px',
+      'padding:0 14px',
+      'border:1px solid rgba(0,0,0,.12)',
+      'border-radius:6px',
+      'background:#ffffff',
+      'color:#111',
+      'font:14px/38px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif',
+      'box-shadow:0 4px 16px rgba(0,0,0,.16)',
+      'cursor:pointer',
+      'letter-spacing:0'
+    ].join(';') + ';';
+  }
+  function setText(btn, text) {
+    btn.textContent = text;
+    btn.setAttribute('title', text);
+  }
+  function refresh(btn) {
+    fetch('/__moore_video_status').then(function (r) { return r.json(); }).then(function (data) {
+      var videos = data.videos || [];
+      if (videos.length) {
+        latestVideoId = videos[0].id || '';
+        setText(btn, '下载视频');
+      } else {
+        setText(btn, '等待视频');
+      }
+    }).catch(function () {
+      setText(btn, '等待视频');
+    });
+  }
+  function installButton() {
+    if (document.getElementById('moore-video-download')) return;
+    var btn = document.createElement('button');
+    btn.id = 'moore-video-download';
+    btn.type = 'button';
+    btn.style.cssText = buttonStyle();
+    setText(btn, '等待视频');
+    btn.addEventListener('click', function () {
+      if (!latestVideoId) {
+        refresh(btn);
+        return;
+      }
+      setText(btn, '下载中');
+      fetch('/__moore_video_download', {
+        method: 'POST',
+        headers: {'content-type': 'application/json'},
+        body: JSON.stringify({id: latestVideoId, quality: 'highest', filename: document.title || 'wechat-video.mp4'})
+      }).then(function (r) { return r.json(); }).then(function (data) {
+        setText(btn, data.ok ? '已下载' : '下载失败');
+        setTimeout(function () { refresh(btn); }, 1600);
+      }).catch(function () {
+        setText(btn, '下载失败');
+      });
+    });
+    document.documentElement.appendChild(btn);
+    refresh(btn);
+    setInterval(function () { refresh(btn); }, 3000);
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', installButton, {once: true});
+  } else {
+    installButton();
+  }
+})();
+</script>
+"""
+
+
+CHANNELS_BUNDLE_INSTALLER = r"""
+;try{(function(){
+  if(window.__mooreVideoBundleInstalled)return;
+  window.__mooreVideoBundleInstalled=true;
+  window.__mooreRegisterObjectDesc=function(objectDesc){
+    try{
+      if(!objectDesc||!objectDesc.media)return;
+      fetch('/__moore_video_register',{
+        method:'POST',
+        headers:{'content-type':'application/json'},
+        body:JSON.stringify({objectDesc:objectDesc,source_url:location.href,title:document.title})
+      }).catch(function(){});
+    }catch(e){}
+  };
+})();}catch(e){}
+"""
 
 
 SNAPSHOT_SCRIPT = r"""
@@ -887,6 +990,15 @@ def is_article_page(host: str, path: str, content_type: str = "") -> bool:
     return plain_path.startswith("/mp/appmsg") and "text/html" in content_type.lower()
 
 
+def is_channels_page(host: str, path: str, content_type: str = "") -> bool:
+    if host != "channels.weixin.qq.com":
+        return False
+    plain_path = path.split("?", 1)[0]
+    if plain_path in {"/web/pages/feed", "/web/pages/home"} or plain_path.startswith("/web/pages/"):
+        return True
+    return "text/html" in content_type.lower() and "/web/pages/" in plain_path
+
+
 def inject_snapshot_button(text: str) -> str:
     if "__mooreSnapshotInstalled" in text:
         return text
@@ -898,6 +1010,41 @@ def inject_snapshot_button(text: str) -> str:
     if "</body>" in text.lower():
         return re.sub(r"</body>", lambda match: script + "\n" + match.group(0), text, count=1, flags=re.I)
     return text + script
+
+
+def inject_channels_video_button(text: str) -> str:
+    if "__mooreVideoInstalled" in text:
+        return text
+    script = CHANNELS_VIDEO_SCRIPT
+    match = re.search(r"<script\b[^>]*\bnonce=[\"']?([^\"'\s>]+)", text, re.I)
+    if match:
+        nonce = html.escape(match.group(1), quote=True)
+        script = script.replace("<script>", f'<script type="text/javascript" nonce="{nonce}" reportloaderror>')
+    if "</body>" in text.lower():
+        return re.sub(r"</body>", lambda match: script + "\n" + match.group(0), text, count=1, flags=re.I)
+    return text + script
+
+
+def inject_channels_bundle_hooks(text: str) -> str:
+    if "__mooreVideoBundleInstalled" in text:
+        return text
+    changed = text
+    changed = re.sub(
+        r"get\s+media\(\)\s*\{",
+        "get media(){try{window.__mooreRegisterObjectDesc&&window.__mooreRegisterObjectDesc(this.objectDesc)}catch(e){}",
+        changed,
+        count=1,
+    )
+    changed = re.sub(
+        r"async\s+finderGetCommentDetail\((\w+)\)\s*\{return(.*?)\}\s*async",
+        r"async finderGetCommentDetail(\1){var res=await\2;try{if(res&&res.data&&res.data.object&&res.data.object.objectDesc&&window.__mooreRegisterObjectDesc){window.__mooreRegisterObjectDesc(res.data.object.objectDesc)}}catch(e){}return res;}async",
+        changed,
+        count=1,
+        flags=re.S,
+    )
+    if changed != text:
+        return CHANNELS_BUNDLE_INSTALLER + "\n" + changed
+    return text
 
 
 def prevent_article_response_cache(response: Any) -> None:
@@ -1100,6 +1247,13 @@ class WeChatHistoryCapture:
 
     def request(self, flow: Any) -> None:
         request = flow.request
+        if request.host in VIDEO_ENDPOINT_HOSTS and request.path.split("?", 1)[0] in {
+            VIDEO_REGISTER_PATH,
+            VIDEO_DOWNLOAD_PATH,
+            VIDEO_STATUS_PATH,
+        }:
+            self._video_service_request(flow)
+            return
         if request.host == "mp.weixin.qq.com" and request.path.split("?", 1)[0] == "/__moore_log":
             self._client_log_post(flow)
             return
@@ -1115,6 +1269,41 @@ class WeChatHistoryCapture:
                 del request.headers[header]
         request.headers["cache-control"] = "no-cache"
         request.headers["pragma"] = "no-cache"
+
+    def _video_service_request(self, flow: Any) -> None:
+        try:
+            from mitmproxy import http
+        except Exception:
+            http = None
+        if not http:
+            return
+        path = flow.request.path.split("?", 1)[0]
+        try:
+            if path == VIDEO_STATUS_PATH:
+                payload = video_status()
+            else:
+                text = flow.request.get_text(strict=False)
+                data = json.loads(text) if text else {}
+                if not isinstance(data, dict):
+                    data = {}
+                headers = {key: flow.request.headers.get(key, "") for key in ("User-Agent", "Referer", "Origin")}
+                if path == VIDEO_REGISTER_PATH:
+                    payload = register_video_payload(data, headers)
+                elif path == VIDEO_DOWNLOAD_PATH:
+                    payload = download_registered_video(data)
+                else:
+                    payload = {"ok": False, "error": "unknown video endpoint"}
+        except Exception as exc:
+            payload = {"ok": False, "error": str(exc)}
+        flow.response = http.Response.make(
+            200,
+            json_response(payload),
+            {
+                "content-type": "application/json; charset=utf-8",
+                "cache-control": "no-store",
+                "access-control-allow-origin": "*",
+            },
+        )
 
     def ensure_credential_broker(self, context: dict[str, Any]) -> WeChatCredentialBroker | None:
         if context["session"].get("mode") != "proxy-enhancer":
@@ -1491,6 +1680,40 @@ class WeChatHistoryCapture:
                 )
                 + "\n"
             )
+        if request.host == "res.wx.qq.com" and ("javascript" in content_type.lower() or path.endswith(".js")):
+            try:
+                text = flow.response.get_text(strict=False)
+            except Exception:
+                text = ""
+            if text and len(text) <= 8_000_000 and ("finderGetCommentDetail" in text or "get media()" in text or "get media(){" in text):
+                injected_text = inject_channels_bundle_hooks(text)
+                injected = injected_text != text
+                self.debug_log(
+                    context,
+                    "video-bundle-inject-result",
+                    {"mode": "proxy-enhancer", "path": path, "injected": injected, "html_length": len(text)},
+                )
+                if injected:
+                    flow.response.set_text(injected_text)
+                    prevent_article_response_cache(flow.response)
+            return
+        if is_channels_page(request.host, path, content_type):
+            try:
+                text = flow.response.get_text(strict=False)
+            except Exception:
+                text = ""
+            if text and len(text) <= 8_000_000:
+                injected_text = inject_channels_video_button(text)
+                injected = injected_text != text
+                self.debug_log(
+                    context,
+                    "video-button-inject-result",
+                    {"mode": "proxy-enhancer", "path": path, "injected": injected, "html_length": len(text)},
+                )
+                if injected:
+                    flow.response.set_text(injected_text)
+                    prevent_article_response_cache(flow.response)
+            return
         if not article_page:
             return
         try:

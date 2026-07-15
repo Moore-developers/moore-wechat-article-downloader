@@ -92,6 +92,7 @@ WECHAT_RADIUM_DIR = Path.home() / "Library" / "Containers" / "com.tencent.xinWeC
 WECHAT_MITM_ALLOW_HOST_RE = (
     r"^(?:.*\.)?"
     r"(?:mp\.weixin\.qq\.com|res\.wx\.qq\.com|mmbiz\.qpic\.cn|support\.weixin\.qq\.com|"
+    r"channels\.weixin\.qq\.com|finder\.video\.qq\.com|wxapp\.tc\.qq\.com|"
     r"wxa\.wxs\.qq\.com|wxsmw\.wxs\.qq\.com|wximg\.wxs\.qq\.com|wx\.qlogo\.cn)"
     r"(?::\d+)?$"
 )

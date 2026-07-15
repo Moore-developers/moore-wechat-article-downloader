@@ -42,6 +42,7 @@ from wechat_downloader import (  # noqa: E402
     DEFAULT_DELIVERY_DIR,
     PAGE_DATA_END,
     PAGE_DATA_START,
+    active_proxy_port,
     clean_url,
     copy_to_clipboard,
     extract_wechat_article_context,
@@ -1607,6 +1608,7 @@ def get_article_download_rows(base: Path, article_ids: list[int]) -> list[dict[s
                 a.url,
                 a.publish_time,
                 a.content_downloaded,
+                a.raw_json,
                 t.nickname AS account_name
             FROM articles a
             JOIN target_accounts t ON t.id = a.account_id
@@ -1810,6 +1812,148 @@ def account_output_dir(root: str, account_name: str) -> Path:
     return (DEFAULT_DELIVERY_DIR / safe_account).expanduser().resolve()
 
 
+def article_raw_payload(row: dict[str, Any]) -> dict[str, Any]:
+    raw = row.get("raw_json")
+    if isinstance(raw, dict):
+        return raw
+    try:
+        payload = json.loads(str(raw or "{}"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def article_may_have_video(row: dict[str, Any]) -> bool:
+    payload = article_raw_payload(row)
+    show_type = str(payload.get("item_show_type") or payload.get("show_type") or payload.get("itemShowType") or "").strip()
+    if show_type == "5":
+        return True
+    for key in ("media_duration", "video_duration", "duration", "video_url", "video_vid", "vid"):
+        if payload.get(key):
+            return True
+    title = str(row.get("title") or "")
+    return bool(re.search(r"\bvideo\b|视频号|视频", title, re.I))
+
+
+def video_proxy_request(base: Path, path: str, method: str = "GET", payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    port = active_proxy_port(base)
+    if not port:
+        return {"ok": False, "status": "needs_capture", "error": "no active proxy-enhancer session"}
+    proxy = f"http://127.0.0.1:{port}"
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    data = None
+    headers = {"User-Agent": "Moore-WeChat-Exporter/1.0"}
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(f"http://channels.weixin.qq.com{path}", data=data, headers=headers, method=method)
+    try:
+        with opener.open(req, timeout=10) as resp:
+            text = resp.read().decode("utf-8", errors="replace")
+    except Exception as exc:
+        return {"ok": False, "status": "needs_capture", "error": str(exc)}
+    try:
+        result = json.loads(text)
+    except Exception:
+        return {"ok": False, "status": "failed", "error": "video proxy returned non-json response"}
+    return result if isinstance(result, dict) else {"ok": False, "status": "failed", "error": "video proxy returned invalid response"}
+
+
+def normalize_match_text(value: str) -> str:
+    return re.sub(r"\s+", "", re.sub(r"^\[(?:图文|贴图|视频)\]\s*", "", str(value or ""))).lower()
+
+
+def select_video_descriptor(row: dict[str, Any], videos: list[dict[str, Any]], candidate_count: int) -> dict[str, Any] | None:
+    if not videos:
+        return None
+    title = normalize_match_text(str(row.get("title") or ""))
+    if title:
+        for item in videos:
+            haystacks = [
+                normalize_match_text(str(item.get("source_title") or "")),
+                normalize_match_text(str(item.get("description") or "")),
+            ]
+            if any(title and (title in haystack or haystack in title) for haystack in haystacks if haystack):
+                return item
+    if len(videos) == 1 and candidate_count == 1:
+        return videos[0]
+    return None
+
+
+def download_exporter_videos(base: Path, rows: list[dict[str, Any]], out_dir: Path, quality: str = "highest") -> dict[str, Any]:
+    candidates = [row for row in rows if article_may_have_video(row)]
+    if not candidates:
+        return {"ok": True, "status": "no_video_candidates", "candidate_count": 0, "success_count": 0, "needs_capture_count": 0, "failed": []}
+    status = video_proxy_request(base, "/__moore_video_status")
+    if not status.get("ok"):
+        return {
+            "ok": False,
+            "status": "needs_capture",
+            "candidate_count": len(candidates),
+            "success_count": 0,
+            "needs_capture_count": len(candidates),
+            "failed": [],
+            "next_step": "Start proxy-enhancer-session-start, open the target WeChat Channels/video page, wait for capture, then rerun exporter-download --include-video.",
+            "error": status.get("error", ""),
+        }
+    videos = status.get("videos") if isinstance(status.get("videos"), list) else []
+    results: list[dict[str, Any]] = []
+    needs_capture: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+    for row in candidates:
+        descriptor = select_video_descriptor(row, videos, len(candidates))
+        if not descriptor:
+            needs_capture.append(
+                {
+                    "article_id": int(row.get("id") or 0),
+                    "title": row.get("title", ""),
+                    "status": "needs_capture",
+                    "reason": "no matching captured video descriptor",
+                }
+            )
+            continue
+        filename = f"[视频]{_safe_dir_name(str(row.get('title') or descriptor.get('description') or 'wechat-video'))}.mp4"
+        payload = {
+            "id": descriptor.get("id"),
+            "quality": quality,
+            "filename": filename,
+            "output_dir": str(out_dir / "videos"),
+        }
+        downloaded = video_proxy_request(base, "/__moore_video_download", "POST", payload)
+        item = {
+            "article_id": int(row.get("id") or 0),
+            "title": row.get("title", ""),
+            "descriptor_id": descriptor.get("id", ""),
+            "status": downloaded.get("status") or ("success" if downloaded.get("ok") else "failed"),
+            "path": downloaded.get("path", ""),
+            "bytes": downloaded.get("bytes", ""),
+            "error": downloaded.get("error", ""),
+        }
+        if downloaded.get("ok"):
+            results.append(item)
+        elif downloaded.get("status") == "needs_capture":
+            needs_capture.append(item)
+        else:
+            failed.append(item)
+    return {
+        "ok": not needs_capture and not failed,
+        "status": "complete" if not needs_capture and not failed else "needs_capture" if needs_capture else "failed",
+        "candidate_count": len(candidates),
+        "success_count": len(results),
+        "needs_capture_count": len(needs_capture),
+        "failure_count": len(failed),
+        "results": results,
+        "needs_capture": needs_capture,
+        "failed": failed,
+        "video_dir": str(out_dir / "videos"),
+        "next_step": (
+            "Open the video page with proxy-enhancer running, then rerun exporter-download --include-video."
+            if needs_capture
+            else ""
+        ),
+    }
+
+
 def log_evolution_event(
     base: Path,
     stage: str,
@@ -1960,6 +2104,8 @@ def download_account_articles(
     output_root: str = "",
     no_assets: bool = False,
     force: bool = False,
+    include_video: bool = False,
+    video_quality: str = "highest",
 ) -> dict[str, Any]:
     if not rows:
         raise RuntimeError("no articles selected")
@@ -1989,8 +2135,9 @@ def download_account_articles(
             rows_to_download.append(row)
     if not rows_to_download:
         library_check = verify_account_library(base, int(rows[0].get("account_id") or 0), out_dir)
+        video_result = download_exporter_videos(base, rows, out_dir, video_quality) if include_video else {}
         return {
-            "ok": True,
+            "ok": not include_video or bool(video_result.get("ok")),
             "run_id": "",
             "account": account_name,
             "account_id": int(rows[0].get("account_id") or 0),
@@ -2004,6 +2151,7 @@ def download_account_articles(
             "skipped": skipped,
             "failed": [],
             "library_check": library_check,
+            "video_download": video_result,
         }
     pairs = [(int(row["id"]), str(row["url"])) for row in rows_to_download]
     urls = [url for _article_id, url in pairs]
@@ -2061,8 +2209,9 @@ def download_account_articles(
                 )
             )
     library_check = verify_account_library(base, int(rows[0].get("account_id") or 0), out_dir)
+    video_result = download_exporter_videos(base, rows_to_download, out_dir, video_quality) if include_video else {}
     return {
-        "ok": manifest["failure_count"] == 0,
+        "ok": manifest["failure_count"] == 0 and (not include_video or bool(video_result.get("ok"))),
         "run_id": manifest["run_id"],
         "account": account_name,
         "account_id": int(rows[0].get("account_id") or 0),
@@ -2077,6 +2226,7 @@ def download_account_articles(
         "failed": manifest["failed"],
         "article_contexts": context_results,
         "library_check": library_check,
+        "video_download": video_result,
     }
 
 
@@ -2087,6 +2237,8 @@ def download_articles(
     no_assets: bool = False,
     account_nickname: str = "",
     force: bool = False,
+    include_video: bool = False,
+    video_quality: str = "highest",
 ) -> dict[str, Any]:
     rows = get_article_download_rows(base, article_ids)
     if not rows:
@@ -2096,8 +2248,11 @@ def download_articles(
         grouped.setdefault(int(row.get("account_id") or 0), []).append(row)
     if len(grouped) == 1:
         only_rows = next(iter(grouped.values()))
-        return download_account_articles(base, only_rows, output_dir, no_assets, force)
-    results = [download_account_articles(base, group_rows, output_dir, no_assets, force) for _account_id, group_rows in sorted(grouped.items())]
+        return download_account_articles(base, only_rows, output_dir, no_assets, force, include_video, video_quality)
+    results = [
+        download_account_articles(base, group_rows, output_dir, no_assets, force, include_video, video_quality)
+        for _account_id, group_rows in sorted(grouped.items())
+    ]
     return {
         "ok": all(result.get("ok") for result in results),
         "mode": "multi-account",
@@ -2112,6 +2267,7 @@ def download_articles(
         "indexes": [result.get("index") for result in results],
         "skipped": [item for result in results for item in result.get("skipped", [])],
         "failed": [item for result in results for item in result.get("failed", [])],
+        "video_downloads": [result.get("video_download") for result in results if result.get("video_download")],
     }
 
 
@@ -3692,12 +3848,18 @@ def sync_all_accounts(base: Path, per_account_limit: int = 50) -> dict[str, Any]
     }
 
 
-def download_new_articles(base: Path, output_dir: str = "", no_assets: bool = False) -> dict[str, Any]:
+def download_new_articles(
+    base: Path,
+    output_dir: str = "",
+    no_assets: bool = False,
+    include_video: bool = False,
+    video_quality: str = "highest",
+) -> dict[str, Any]:
     rows = list_articles(base, account_id=0, limit=5000, downloaded="no")
     if not rows:
         return {"ok": True, "message": "no new articles to download", "success_count": 0, "failure_count": 0}
     ids = [int(row["id"]) for row in rows]
-    return download_articles(base, ids, output_dir, no_assets)
+    return download_articles(base, ids, output_dir, no_assets, include_video=include_video, video_quality=video_quality)
 
 
 def daily_run(base: Path, per_account_limit: int = 50, output_dir: str = "", no_assets: bool = False) -> dict[str, Any]:
@@ -3716,7 +3878,7 @@ def command_sync_all(args: argparse.Namespace) -> int:
 
 
 def command_download_new(args: argparse.Namespace) -> int:
-    result = download_new_articles(runtime_dir(args.runtime_dir), args.output_dir, args.no_assets)
+    result = download_new_articles(runtime_dir(args.runtime_dir), args.output_dir, args.no_assets, args.include_video, args.video_quality)
     write_json_response(result)
     return 0 if result.get("ok") else 1
 
@@ -3763,7 +3925,15 @@ def command_download(args: argparse.Namespace) -> int:
         keyword=args.keyword,
         collection_id=args.collection_id,
     )
-    result = download_articles(base, ids, args.output_dir, args.no_assets, force=args.force)
+    result = download_articles(
+        base,
+        ids,
+        args.output_dir,
+        args.no_assets,
+        force=args.force,
+        include_video=args.include_video,
+        video_quality=args.video_quality,
+    )
     write_json_response(result)
     return 0 if result.get("ok") else 1
 
@@ -4591,6 +4761,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--runtime-dir", default=argparse.SUPPRESS)
     p.add_argument("--output-dir", default="")
     p.add_argument("--no-assets", action="store_true")
+    p.add_argument("--include-video", action="store_true", help="Also download captured WeChat Channels videos when the article is video-shaped")
+    p.add_argument("--video-quality", choices=["source", "lowest", "middle", "highest"], default="highest")
     p.set_defaults(func=command_download_new)
 
     p = sub.add_parser("exporter-daily-run")
@@ -4630,6 +4802,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output-dir", default="")
     p.add_argument("--no-assets", action="store_true")
     p.add_argument("--force", action="store_true", help="Overwrite existing local Markdown instead of skipping")
+    p.add_argument("--include-video", action="store_true", help="Also download captured WeChat Channels videos when the article is video-shaped")
+    p.add_argument("--video-quality", choices=["source", "lowest", "middle", "highest"], default="highest")
     p.set_defaults(func=command_download)
 
     p = sub.add_parser("exporter-fields")

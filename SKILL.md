@@ -169,6 +169,14 @@ python3 {baseDir}/scripts/wechat_downloader.py proxy-enhancer-video-links --hour
 - **没有结果不代表没有视频**：可能是页面未重新打开、流量未经过代理、链接只存在于客户端内部状态，或公开链接依赖已过滤的临时凭证。报告时必须说明是哪一层没有观察到。
 - **结束时恢复系统代理**：用户明确结束常驻拦截后运行 `proxy-enhancer-session-finish --yes`，避免系统继续指向已停止的本地端口。
 
+视频下载入口：
+
+- **Exporter 直接下载**：先运行常驻增强代理并打开目标视频页完成短时媒体凭证捕获，再执行 `python3 {baseDir}/scripts/wechat_exporter.py exporter-download --account-id <id> --latest <N> --include-video --video-quality highest`。输出在账号目录 `videos/` 下，文件名前缀为 `[视频]`。
+- **视频号页面按钮**：常驻增强代理会尝试在 `channels.weixin.qq.com/web/pages/...` 页面注入“下载视频”按钮；按钮只在用户当前有权限播放、页面 JS 暴露 `objectDesc.media[]` 后可下载。
+- **无凭证必须明示**：Exporter 未发现活跃代理或匹配的短时媒体描述时返回 `needs_capture`，不得报告视频下载成功。处理方式是保持/启动 `proxy-enhancer-session-start --yes`，重新打开目标视频页，等按钮显示“下载视频”后再重跑。
+- **敏感字段只留内存**：`urlToken`、`decodeKey`、签名媒体 URL、Cookie 和请求头只在代理进程内短时保存和下载使用；禁止写入 SQLite、Markdown、JSONL、调试日志或聊天输出。结果只报告页面 URL、descriptor id、文件路径、大小、是否解密。
+- **能力边界**：不绕过私密、付费或 DRM 内容；只下载用户当前会话能播放的公开视频。加密视频会按 `decodeKey` 生成 128 KiB key stream 并 XOR 文件头，失败时标记 `failed` / `decrypt_failed`。
+
 调试日志位于 `~/.moore/wechat-article-downloader/proxy-snapshots/debug.jsonl`，只记录脱敏事件：请求路径、响应状态、是否识别为文章页、是否注入脚本、页面脚本是否执行、按钮是否放置成功。日志只保留 24 小时；清理动作每 12 小时最多执行一次。
 
 成功识别并注入的文章 HTML 响应必须写入 `Cache-Control: no-store`，并移除 `ETag` / `Last-Modified`，防止微信 WebView 在下一次会话继续复用未更新的注入代码。已禁用的系统代理状态视为没有 endpoint；不要保存或展示其残留的 server/port。
