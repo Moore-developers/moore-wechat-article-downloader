@@ -1475,9 +1475,7 @@ def active_qr_login_session(base: Path, task_id: str = "") -> dict[str, Any] | N
             continue
         if task_id and str(session.get("task_id") or "") != task_id:
             continue
-        status = str(session.get("status") or "")
-        expires_at = parse_iso_time(str(session.get("expires_at") or ""))
-        if status in {"waiting_for_scan", "scanned_waiting_confirm"} and expires_at and expires_at > now:
+        if wechat_exporter.is_reusable_qr_login_session(session, now=now):
             return session
     return None
 
@@ -1516,7 +1514,7 @@ def gate_exporter_auth(base: Path, task_id: str, required: bool) -> dict[str, An
                 "base_url": started.get("base_url", base_url),
                 "qrcode_path": started.get("qrcode_path", ""),
                 "expires_at": started.get("expires_at", ""),
-                "status": "waiting_for_scan",
+                "status": started.get("status", "waiting_for_scan"),
                 "task_id": task_id,
             }
             try:

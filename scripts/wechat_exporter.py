@@ -805,10 +805,131 @@ def extract_cookie_value(set_cookies: list[str], name: str) -> str:
     return ""
 
 
+QR_LOGIN_REUSABLE_STATUSES = {"waiting_for_scan", "scanned_waiting_confirm", "confirmed"}
+QR_LOGIN_PROMPT = "请扫码：请用微信扫码并在手机端确认。"
+
+
+def parse_iso_datetime(value: str) -> dt.datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed
+
+
+def qr_login_qrcode_exists(session: dict[str, Any]) -> bool:
+    raw_path = str(session.get("qrcode_path") or "").strip()
+    return bool(raw_path) and Path(raw_path).expanduser().exists()
+
+
+def is_reusable_qr_login_session(session: dict[str, Any], base_url: str = "", now: dt.datetime | None = None) -> bool:
+    if not str(session.get("login_id") or ""):
+        return False
+    status = str(session.get("status") or "")
+    if status not in QR_LOGIN_REUSABLE_STATUSES:
+        return False
+    expires_at = parse_iso_datetime(str(session.get("expires_at") or ""))
+    if not expires_at:
+        return False
+    current = now or dt.datetime.now(dt.timezone.utc)
+    if expires_at <= current:
+        return False
+    if base_url and str(session.get("base_url") or "") != base_url:
+        return False
+    return qr_login_qrcode_exists(session)
+
+
+def find_reusable_qr_login_session(base: Path, base_url: str) -> dict[str, Any] | None:
+    directory = login_dir(base)
+    if not directory.exists():
+        return None
+    now = dt.datetime.now(dt.timezone.utc)
+    for path in sorted(directory.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
+        try:
+            session = read_json_file(path)
+        except Exception:
+            continue
+        if not isinstance(session, dict):
+            continue
+        status = str(session.get("status") or "")
+        expires_at = parse_iso_datetime(str(session.get("expires_at") or ""))
+        if status in QR_LOGIN_REUSABLE_STATUSES and expires_at and expires_at <= now:
+            session["status"] = "expired"
+            session["updated_at"] = utc_now()
+            write_json_file(path, session)
+            continue
+        if is_reusable_qr_login_session(session, base_url, now):
+            return session
+    return None
+
+
+def qr_login_next_step(status: str) -> str:
+    if status == "confirmed":
+        return "已扫码并确认，运行 exporter-login-qr-complete 完成登录。"
+    if status == "scanned_waiting_confirm":
+        return "已扫码，请在手机端确认；确认后运行 exporter-login-qr-status 和 exporter-login-qr-complete。"
+    return "请用微信扫码并在手机端确认；确认后运行 exporter-login-qr-status 和 exporter-login-qr-complete。"
+
+
+def open_qr_login_session_once(base: Path, session: dict[str, Any], open_qrcode: bool) -> dict[str, Any]:
+    if not open_qrcode:
+        return {}
+    if session.get("qrcode_open_attempted_at"):
+        return {
+            "opened": bool(session.get("qrcode_opened")),
+            "open_method": str(session.get("qrcode_open_method") or ""),
+            "open_error": str(session.get("qrcode_open_error") or ""),
+            "open_skipped": "already_attempted",
+        }
+    qrcode_path = Path(str(session.get("qrcode_path") or ""))
+    open_result = open_local_file(qrcode_path)
+    now = utc_now()
+    session["qrcode_open_attempted_at"] = now
+    session["qrcode_opened"] = bool(open_result.get("opened"))
+    session["qrcode_open_method"] = str(open_result.get("open_method") or "")
+    session["qrcode_open_error"] = str(open_result.get("open_error") or "")
+    if open_result.get("opened"):
+        session["qrcode_opened_at"] = now
+    session["updated_at"] = now
+    write_json_file(login_session_path(base, str(session.get("login_id") or "")), session)
+    open_result["open_skipped"] = ""
+    return open_result
+
+
+def qr_login_start_result(
+    base: Path,
+    session: dict[str, Any],
+    *,
+    open_qrcode: bool,
+    reused: bool,
+) -> dict[str, Any]:
+    status = str(session.get("status") or "waiting_for_scan")
+    result = {
+        "ok": True,
+        "login_id": str(session.get("login_id") or ""),
+        "base_url": str(session.get("base_url") or ""),
+        "qrcode_path": str(session.get("qrcode_path") or ""),
+        "expires_at": str(session.get("expires_at") or ""),
+        "status": status,
+        "reused_existing_session": reused,
+        "message": QR_LOGIN_PROMPT,
+        "next_step": qr_login_next_step(status),
+    }
+    result.update(open_qr_login_session_once(base, session, open_qrcode))
+    return result
+
+
 def start_qr_login(base: Path, base_url: str, open_qrcode: bool = False) -> dict[str, Any]:
     init_exporter_db(base)
     base_url = normalize_base_url(base_url or get_config(base, "base_url", DEFAULT_BASE_URL))
     set_config(base, "base_url", base_url)
+    reusable = find_reusable_qr_login_session(base, base_url)
+    if reusable:
+        return qr_login_start_result(base, reusable, open_qrcode=open_qrcode, reused=True)
     login_id = uuid.uuid4().hex
     sid = str(int(time.time() * 1000)) + str(int(time.time_ns() % 100))
     jar = login_cookie_jar(base, login_id)
@@ -843,17 +964,7 @@ def start_qr_login(base: Path, base_url: str, open_qrcode: bool = False) -> dict
         "expires_at": expires_at,
     }
     write_json_file(login_session_path(base, login_id), session)
-    result = {
-        "ok": True,
-        "login_id": login_id,
-        "base_url": base_url,
-        "qrcode_path": str(qrcode_path),
-        "expires_at": expires_at,
-        "next_step": "Scan the QR code with WeChat, confirm login, then run exporter-login-qr-status and exporter-login-qr-complete.",
-    }
-    if open_qrcode:
-        result.update(open_local_file(qrcode_path))
-    return result
+    return qr_login_start_result(base, session, open_qrcode=open_qrcode, reused=False)
 
 
 def load_qr_login_session(base: Path, login_id: str) -> dict[str, Any]:
@@ -4192,8 +4303,8 @@ def wizard_login_required(base: Path, session_id: str, request: dict[str, Any], 
     try:
         if login_id:
             previous = load_qr_login_session(base, login_id)
-            if str(previous.get("status")) == "waiting_for_scan":
-                login = {"login_id": login_id, "qrcode_path": previous.get("qrcode_path", ""), "expires_at": previous.get("expires_at", "")}
+            if is_reusable_qr_login_session(previous):
+                login = qr_login_start_result(base, previous, open_qrcode=True, reused=True)
             else:
                 login = start_qr_login(base, str(request.get("base_url") or ""), open_qrcode=True)
         else:
@@ -4208,9 +4319,12 @@ def wizard_login_required(base: Path, session_id: str, request: dict[str, Any], 
         "account": slim_account(account) if account else {},
         "login_id": str(login.get("login_id") or login_id),
         "expires_at": str(login.get("expires_at") or ""),
+        "status": str(login.get("status") or ""),
+        "message": str(login.get("message") or QR_LOGIN_PROMPT),
+        "reused_existing_session": bool(login.get("reused_existing_session", False)),
         "artifacts": [{"type": "image", "path": qrcode_path, "alt": "微信扫码登录"}] if qrcode_path else [],
         "error": error,
-        "next_step": "请扫描结果中的二维码并确认登录；确认后恢复同一任务。",
+        "next_step": str(login.get("next_step") or "请扫码并在手机端确认；确认后恢复同一任务。"),
     }
     save_wizard_session(base, session_id, str(request.get("target") or ""), "need_login", request, selected_account_id=int(account.get("id") or 0) if account else 0, result=result)
     return result

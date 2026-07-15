@@ -264,6 +264,104 @@ class ExporterContractTests(unittest.TestCase):
         self.assertTrue(default_args.open)
         self.assertFalse(headless_args.open)
 
+    def test_qr_start_reuses_unfinished_session_and_opens_once(self) -> None:
+        login_id = "existing-login"
+        qrcode_path = self.tmp / "exporter-login" / "existing-login.png"
+        qrcode_path.parent.mkdir(parents=True, exist_ok=True)
+        qrcode_path.write_bytes(b"\x89PNG\r\n")
+        wechat_exporter.write_json_file(
+            wechat_exporter.login_session_path(self.tmp, login_id),
+            {
+                "login_id": login_id,
+                "sid": "sid-existing",
+                "base_url": wechat_exporter.DEFAULT_BASE_URL,
+                "qrcode_path": str(qrcode_path),
+                "qrcode_content_type": "image/png",
+                "status": "waiting_for_scan",
+                "created_at": "2099-01-01T00:00:00+00:00",
+                "expires_at": "2099-01-01T00:10:00+00:00",
+            },
+        )
+        original_request = wechat_exporter.request_with_cookie_jar
+        original_open = wechat_exporter.open_local_file
+        open_calls: list[Path] = []
+
+        def fail_request(*_args: object, **_kwargs: object) -> tuple[bytes, dict, list[str], str]:
+            raise AssertionError("QR start should reuse the existing session before requesting a new QR")
+
+        def fake_open(path: Path) -> dict:
+            open_calls.append(path)
+            return {"opened": True, "open_method": "fake-open", "open_error": ""}
+
+        try:
+            wechat_exporter.request_with_cookie_jar = fail_request
+            wechat_exporter.open_local_file = fake_open
+            first = wechat_exporter.start_qr_login(self.tmp, wechat_exporter.DEFAULT_BASE_URL, open_qrcode=True)
+            second = wechat_exporter.start_qr_login(self.tmp, wechat_exporter.DEFAULT_BASE_URL, open_qrcode=True)
+        finally:
+            wechat_exporter.request_with_cookie_jar = original_request
+            wechat_exporter.open_local_file = original_open
+
+        self.assertEqual(first["login_id"], login_id)
+        self.assertTrue(first["reused_existing_session"])
+        self.assertIn("请扫码", first["message"])
+        self.assertTrue(first["opened"])
+        self.assertEqual(second["login_id"], login_id)
+        self.assertEqual(second["open_skipped"], "already_attempted")
+        self.assertEqual(open_calls, [qrcode_path])
+        saved = wechat_exporter.read_json_file(wechat_exporter.login_session_path(self.tmp, login_id))
+        self.assertTrue(saved["qrcode_open_attempted_at"])
+        self.assertTrue(saved["qrcode_opened"])
+
+    def test_qr_start_regenerates_after_existing_session_expires(self) -> None:
+        login_id = "expired-login"
+        qrcode_path = self.tmp / "exporter-login" / "expired-login.png"
+        qrcode_path.parent.mkdir(parents=True, exist_ok=True)
+        qrcode_path.write_bytes(b"\x89PNG\r\n")
+        wechat_exporter.write_json_file(
+            wechat_exporter.login_session_path(self.tmp, login_id),
+            {
+                "login_id": login_id,
+                "sid": "sid-expired",
+                "base_url": wechat_exporter.DEFAULT_BASE_URL,
+                "qrcode_path": str(qrcode_path),
+                "qrcode_content_type": "image/png",
+                "status": "waiting_for_scan",
+                "created_at": "2000-01-01T00:00:00+00:00",
+                "expires_at": "2000-01-01T00:10:00+00:00",
+            },
+        )
+        original_request = wechat_exporter.request_with_cookie_jar
+        original_uuid4 = wechat_exporter.uuid.uuid4
+        paths: list[str] = []
+
+        class FakeUuid:
+            hex = "new-login"
+
+        def fake_request(_base_url: str, path: str, *_args: object, **_kwargs: object) -> tuple[bytes, dict, list[str], str]:
+            paths.append(path)
+            if path.startswith("/api/web/login/session/"):
+                return b"{}", {"base_resp": {"ret": 0}}, [], "application/json"
+            if path.startswith("/api/web/login/getqrcode"):
+                return b"\x89PNG\r\nnew", {}, [], "image/png"
+            raise AssertionError(path)
+
+        try:
+            wechat_exporter.request_with_cookie_jar = fake_request
+            wechat_exporter.uuid.uuid4 = lambda: FakeUuid()
+            result = wechat_exporter.start_qr_login(self.tmp, wechat_exporter.DEFAULT_BASE_URL, open_qrcode=False)
+        finally:
+            wechat_exporter.request_with_cookie_jar = original_request
+            wechat_exporter.uuid.uuid4 = original_uuid4
+
+        self.assertEqual(result["login_id"], "new-login")
+        self.assertFalse(result["reused_existing_session"])
+        self.assertIn("请扫码", result["message"])
+        self.assertTrue((self.tmp / "exporter-login" / "new-login.png").exists())
+        expired = wechat_exporter.read_json_file(wechat_exporter.login_session_path(self.tmp, login_id))
+        self.assertEqual(expired["status"], "expired")
+        self.assertTrue(any(path.startswith("/api/web/login/getqrcode") for path in paths))
+
     def test_field_preset_rejects_unknown_fields(self) -> None:
         payload = self.run_cli("exporter-fields", "--set", "title,url,publish_time,token")
         self.assertTrue(payload["ok"])
