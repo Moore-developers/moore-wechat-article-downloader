@@ -1510,7 +1510,7 @@ def gate_exporter_auth(base: Path, task_id: str, required: bool) -> dict[str, An
     qr_auto_disabled = os.environ.get("MOORE_WECHAT_WIZARD_DISABLE_QR_AUTO") == "1"
     if not qr_session and not qr_auto_disabled:
         try:
-            started = wechat_exporter.start_qr_login(base, base_url)
+            started = wechat_exporter.start_qr_login(base, base_url, open_qrcode=True)
             qr_session = {
                 "login_id": started.get("login_id", ""),
                 "base_url": started.get("base_url", base_url),

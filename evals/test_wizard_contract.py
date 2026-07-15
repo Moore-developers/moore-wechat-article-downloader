@@ -426,9 +426,42 @@ class WizardContractTests(unittest.TestCase):
         self.assertEqual(run_json["success_count"], 1)
         markdown_files = sorted((actual_output_dir / "articles").glob("*.md"))
         self.assertEqual(len(markdown_files), 1)
+        self.assertIn("[图文]", markdown_files[0].name)
         markdown = markdown_files[0].read_text(encoding="utf-8")
+        self.assertIn('title: "[图文]', markdown)
+        self.assertIn('content_type: "图文"', markdown)
         self.assertIn("离线 fixture 文章正文", markdown)
         self.assertIn("测试公众号", markdown)
+
+    def test_url_goal_extracts_content_noencode_without_wechat_shell(self) -> None:
+        output_dir = self.tmp / "content-noencode-output"
+        _code, payload = self.run_cli(
+            "run",
+            "下载这篇公众号文章：https://mp.weixin.qq.com/s/demo-url-article-content-noencode",
+            "--output-dir",
+            str(output_dir),
+            "--no-assets",
+            extra_env={"MOORE_WECHAT_HTML_FIXTURE_DIR": str(HTML_FIXTURES)},
+        )
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["success_count"], 1)
+        markdown_files = sorted((Path(payload["output_dir"]) / "articles").glob("*.md"))
+        self.assertEqual(len(markdown_files), 1)
+        self.assertIn("[贴图]", markdown_files[0].name)
+        markdown = markdown_files[0].read_text(encoding="utf-8")
+        self.assertIn('title: "[贴图]贴图公众号正文提取测试"', markdown)
+        self.assertIn('content_type: "贴图"', markdown)
+        self.assertIn('item_show_type: "8"', markdown)
+        self.assertIn("## 图片", markdown)
+        self.assertIn("## 内容", markdown)
+        self.assertIn("## 隐藏字段正文", markdown)
+        self.assertIn("这是从 content_noencode 提取的完整正文。", markdown)
+        self.assertIn("Unicode：正文 🖼", markdown)
+        self.assertIn("![正文配图](https://mmbiz.qpic.cn/test.png)", markdown)
+        self.assertLess(markdown.index("![正文配图]"), markdown.index("这是从 content_noencode 提取的完整正文。"))
+        self.assertNotIn("微信扫一扫", markdown)
+        self.assertNotIn("小程序 赞 在看", markdown)
 
     def test_url_goal_downloads_multiple_articles_and_records_items(self) -> None:
         output_dir = self.tmp / "multi-output"
@@ -446,7 +479,7 @@ class WizardContractTests(unittest.TestCase):
         actual_output_dir = Path(payload["output_dir"])
         self.assertEqual(len(list((actual_output_dir / "articles").glob("*.md"))), 2)
         articles = json.loads(Path(payload["articles_json"]).read_text(encoding="utf-8"))
-        self.assertEqual([item["title"] for item in articles], ["离线单篇下载测试", "离线多篇下载测试"])
+        self.assertEqual([item["title"] for item in articles], ["[图文]离线单篇下载测试", "[图文]离线多篇下载测试"])
         db = sqlite3.connect(self.tmp / "wizard.sqlite")
         try:
             items = db.execute(
@@ -856,7 +889,7 @@ class WizardContractTests(unittest.TestCase):
     def test_exporter_auth_gate_starts_qr_login_session(self) -> None:
         original_start = wechat_wizard.wechat_exporter.start_qr_login
 
-        def fake_start_qr_login(base: Path, base_url: str) -> dict:
+        def fake_start_qr_login(base: Path, base_url: str, open_qrcode: bool = False) -> dict:
             qrcode_path = base / "login" / "fake-login.qrcode.png"
             qrcode_path.parent.mkdir(parents=True, exist_ok=True)
             qrcode_path.write_bytes(b"\x89PNG\r\n")
@@ -1842,6 +1875,45 @@ class WizardContractTests(unittest.TestCase):
         self.assertEqual(response.headers["cache-control"], "no-store, no-cache, must-revalidate, max-age=0")
         self.assertNotIn("etag", response.headers)
         self.assertNotIn("last-modified", response.headers)
+
+    def test_video_channel_links_are_public_page_urls_and_credentials_are_removed(self) -> None:
+        session = wechat_downloader.enhancer_session(self.tmp, 23555)
+        wechat_downloader.save_history_session(self.tmp, session)
+        original_runtime = os.environ.get("MOORE_WECHAT_RUNTIME_DIR")
+        original_session = os.environ.get("MOORE_WECHAT_SESSION_ID")
+        try:
+            os.environ["MOORE_WECHAT_RUNTIME_DIR"] = str(self.tmp)
+            os.environ["MOORE_WECHAT_SESSION_ID"] = session["session_id"]
+            addon = importlib.import_module("wechat_history_mitm_addon")
+            addon = importlib.reload(addon)
+        finally:
+            if original_runtime is None:
+                os.environ.pop("MOORE_WECHAT_RUNTIME_DIR", None)
+            else:
+                os.environ["MOORE_WECHAT_RUNTIME_DIR"] = original_runtime
+            if original_session is None:
+                os.environ.pop("MOORE_WECHAT_SESSION_ID", None)
+            else:
+                os.environ["MOORE_WECHAT_SESSION_ID"] = original_session
+        links = addon.extract_channels_urls(
+            r'''{"url":"https:\/\/channels.weixin.qq.com\/web\/pages\/feed?finderUsername=demo&exportkey=secret&token=hidden"}'''
+            " https://finder.video.qq.com/media.mp4?key=secret"
+        )
+        self.assertEqual(
+            links,
+            ["https://channels.weixin.qq.com/web/pages/feed?finderUsername=demo"],
+        )
+        self.assertEqual(addon.sanitize_channels_url("https://channels.weixin.qq.com/static/app.js"), "")
+
+        log = wechat_downloader.auto_snapshot_root(self.tmp) / "video-links.jsonl"
+        addon.append_video_links(log, links, "mp.weixin.qq.com", "/s", "response-body")
+        addon.append_video_links(log, links, "mp.weixin.qq.com", "/s", "response-body")
+        payload = wechat_downloader.proxy_enhancer_video_links(self.tmp)
+        self.assertEqual(payload["link_count"], 1)
+        self.assertEqual(payload["links"][0]["url"], links[0])
+        serialized = log.read_text(encoding="utf-8")
+        self.assertNotIn("secret", serialized)
+        self.assertNotIn("hidden", serialized)
 
     def test_history_mitm_addon_extracts_embedded_msg_list_html(self) -> None:
         original_runtime = os.environ.get("MOORE_WECHAT_RUNTIME_DIR")

@@ -135,6 +135,63 @@ def login_qrcode_path_with_extension(base: Path, login_id: str, content_type: st
     return login_dir(base) / f"{safe_name(login_id, 80)}{suffix}"
 
 
+def open_local_file(path: Path) -> dict[str, Any]:
+    target = path.expanduser().resolve()
+    if not target.exists():
+        return {"opened": False, "open_method": "", "open_error": "file does not exist"}
+
+    def run(command: list[str], method: str) -> dict[str, Any]:
+        try:
+            completed = subprocess.run(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return {"opened": False, "open_method": method, "open_error": str(exc)}
+        error = (completed.stderr or "").strip()
+        return {"opened": completed.returncode == 0, "open_method": method, "open_error": error[:300]}
+
+    if sys.platform == "darwin":
+        return run(["open", str(target)], "macos-open")
+    if os.name == "nt":
+        try:
+            os.startfile(str(target))  # type: ignore[attr-defined]
+            return {"opened": True, "open_method": "windows-startfile", "open_error": ""}
+        except OSError as exc:
+            return {"opened": False, "open_method": "windows-startfile", "open_error": str(exc)}
+    if os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP"):
+        try:
+            converted = subprocess.run(
+                ["wslpath", "-w", str(target)],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            converted = None
+        windows_path = converted.stdout.strip() if converted and converted.returncode == 0 else ""
+        if windows_path:
+            return run(["explorer.exe", windows_path], "wsl-explorer")
+    for executable, arguments, method in [
+        ("xdg-open", [str(target)], "linux-xdg-open"),
+        ("gio", ["open", str(target)], "linux-gio-open"),
+    ]:
+        command = shutil.which(executable)
+        if command:
+            return run([command, *arguments], method)
+    opened = webbrowser.open(target.as_uri())
+    return {
+        "opened": bool(opened),
+        "open_method": "python-webbrowser",
+        "open_error": "" if opened else "no system file opener is available",
+    }
+
+
 def app_db_path(base: Path) -> Path:
     return base / "exporter.sqlite"
 
@@ -747,7 +804,7 @@ def extract_cookie_value(set_cookies: list[str], name: str) -> str:
     return ""
 
 
-def start_qr_login(base: Path, base_url: str) -> dict[str, Any]:
+def start_qr_login(base: Path, base_url: str, open_qrcode: bool = False) -> dict[str, Any]:
     init_exporter_db(base)
     base_url = normalize_base_url(base_url or get_config(base, "base_url", DEFAULT_BASE_URL))
     set_config(base, "base_url", base_url)
@@ -785,7 +842,7 @@ def start_qr_login(base: Path, base_url: str) -> dict[str, Any]:
         "expires_at": expires_at,
     }
     write_json_file(login_session_path(base, login_id), session)
-    return {
+    result = {
         "ok": True,
         "login_id": login_id,
         "base_url": base_url,
@@ -793,6 +850,9 @@ def start_qr_login(base: Path, base_url: str) -> dict[str, Any]:
         "expires_at": expires_at,
         "next_step": "Scan the QR code with WeChat, confirm login, then run exporter-login-qr-status and exporter-login-qr-complete.",
     }
+    if open_qrcode:
+        result.update(open_local_file(qrcode_path))
+    return result
 
 
 def load_qr_login_session(base: Path, login_id: str) -> dict[str, Any]:
@@ -1618,6 +1678,8 @@ def write_account_index(output_dir: Path, rows: list[dict[str, Any]], manifest: 
         "markdown_path",
         "image_dir",
         "image_count",
+        "content_type",
+        "item_show_type",
         "status",
         "error",
         "downloaded_at",
@@ -1644,13 +1706,15 @@ def write_account_index(output_dir: Path, rows: list[dict[str, Any]], manifest: 
             "seq": item.get("seq", ""),
             "db_article_id": row.get("id", ""),
             "msgid": row.get("msgid", ""),
-            "title": row.get("title", item.get("title", "")),
+            "title": item.get("title", row.get("title", "")),
             "account": row.get("account_name", item.get("account", "")),
             "publish_time": row.get("publish_time", ""),
             "source_url": source_url,
             "markdown_path": item.get("markdown_path", ""),
             "image_dir": item.get("image_dir", ""),
             "image_count": item.get("image_count", ""),
+            "content_type": item.get("content_type", ""),
+            "item_show_type": item.get("item_show_type", ""),
             "status": item.get("status", "success"),
             "error": item.get("error", ""),
             "downloaded_at": downloaded_at,
@@ -3506,13 +3570,7 @@ def command_login_start(args: argparse.Namespace) -> int:
 
 
 def command_login_qr_start(args: argparse.Namespace) -> int:
-    result = start_qr_login(runtime_dir(args.runtime_dir), args.base_url)
-    if args.open:
-        qrcode_path = Path(str(result["qrcode_path"]))
-        if sys.platform == "darwin":
-            subprocess.run(["open", str(qrcode_path)], check=False)
-        else:
-            webbrowser.open(qrcode_path.as_uri())
+    result = start_qr_login(runtime_dir(args.runtime_dir), args.base_url, open_qrcode=args.open)
     write_json_response(result)
     return 0
 
@@ -3967,9 +4025,9 @@ def wizard_login_required(base: Path, session_id: str, request: dict[str, Any], 
             if str(previous.get("status")) == "waiting_for_scan":
                 login = {"login_id": login_id, "qrcode_path": previous.get("qrcode_path", ""), "expires_at": previous.get("expires_at", "")}
             else:
-                login = start_qr_login(base, str(request.get("base_url") or ""))
+                login = start_qr_login(base, str(request.get("base_url") or ""), open_qrcode=True)
         else:
-            login = start_qr_login(base, str(request.get("base_url") or ""))
+            login = start_qr_login(base, str(request.get("base_url") or ""), open_qrcode=True)
     except Exception as exc:
         return {"ok": False, "state": "need_login", "session_id": session_id, "error": str(exc) or error}
     qrcode_path = str(login.get("qrcode_path") or "")
@@ -4450,7 +4508,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("exporter-login-qr-start")
     p.add_argument("--runtime-dir", default=argparse.SUPPRESS)
     p.add_argument("--base-url", default="")
-    p.add_argument("--open", action="store_true", help="Open the QR image after fetching it")
+    p.add_argument("--open", dest="open", action="store_true", default=True, help="Open the QR image with the system viewer (default)")
+    p.add_argument("--no-open", dest="open", action="store_false", help="Do not open the QR image (for headless/CI use)")
     p.set_defaults(func=command_login_qr_start)
 
     p = sub.add_parser("exporter-login-qr-status")

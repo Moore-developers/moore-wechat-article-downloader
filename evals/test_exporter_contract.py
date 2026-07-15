@@ -233,6 +233,37 @@ class ExporterContractTests(unittest.TestCase):
         self.assertEqual(jpg.suffix, ".jpg")
         self.assertEqual(png.suffix, ".png")
 
+    def test_open_local_file_uses_native_macos_opener(self) -> None:
+        image = self.tmp / "qr code.png"
+        image.write_bytes(b"fake")
+        original_platform = wechat_exporter.sys.platform
+        original_run = wechat_exporter.subprocess.run
+        calls: list[list[str]] = []
+
+        def fake_run(command: list[str], **_kwargs: object) -> object:
+            calls.append(command)
+            return type("Completed", (), {"returncode": 0, "stderr": ""})()
+
+        try:
+            wechat_exporter.sys.platform = "darwin"
+            wechat_exporter.subprocess.run = fake_run
+            result = wechat_exporter.open_local_file(image)
+        finally:
+            wechat_exporter.sys.platform = original_platform
+            wechat_exporter.subprocess.run = original_run
+
+        self.assertTrue(result["opened"])
+        self.assertEqual(result["open_method"], "macos-open")
+        self.assertEqual(calls, [["open", str(image.resolve())]])
+
+    def test_qr_start_opens_by_default_and_supports_headless_opt_out(self) -> None:
+        parser = wechat_exporter.build_parser()
+        default_args = parser.parse_args(["exporter-login-qr-start"])
+        headless_args = parser.parse_args(["exporter-login-qr-start", "--no-open"])
+
+        self.assertTrue(default_args.open)
+        self.assertFalse(headless_args.open)
+
     def test_field_preset_rejects_unknown_fields(self) -> None:
         payload = self.run_cli("exporter-fields", "--set", "title,url,publish_time,token")
         self.assertTrue(payload["ok"])

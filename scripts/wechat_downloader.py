@@ -594,24 +594,160 @@ def extract_wechat_article_context(raw_html: str, url: str) -> dict[str, str]:
     return {"biz": clues["biz"], "comment_id": comment_id}
 
 
+def decode_js_string(raw_html: str, start: int, quote: str) -> tuple[str, int]:
+    """Decode one JavaScript string literal without evaluating page code."""
+    chars: list[str] = []
+    index = start
+    escape_chars = {
+        "b": "\b",
+        "f": "\f",
+        "n": "\n",
+        "r": "\r",
+        "t": "\t",
+        "v": "\v",
+        "0": "\0",
+    }
+    while index < len(raw_html):
+        char = raw_html[index]
+        if char == quote:
+            decoded = "".join(chars)
+            decoded = decoded.encode("utf-16-le", errors="surrogatepass").decode("utf-16-le", errors="replace")
+            return decoded, index + 1
+        if char != "\\":
+            chars.append(char)
+            index += 1
+            continue
+
+        index += 1
+        if index >= len(raw_html):
+            break
+        escaped = raw_html[index]
+        if escaped in "\n\u2028\u2029":
+            index += 1
+            continue
+        if escaped == "\r":
+            index += 2 if index + 1 < len(raw_html) and raw_html[index + 1] == "\n" else 1
+            continue
+        if escaped == "x":
+            digits = raw_html[index + 1 : index + 3]
+            if len(digits) != 2 or not re.fullmatch(r"[0-9a-fA-F]{2}", digits):
+                raise ValueError("invalid hexadecimal escape in content_noencode")
+            chars.append(chr(int(digits, 16)))
+            index += 3
+            continue
+        if escaped == "u":
+            if index + 1 < len(raw_html) and raw_html[index + 1] == "{":
+                end = raw_html.find("}", index + 2)
+                digits = raw_html[index + 2 : end] if end >= 0 else ""
+                if not digits or len(digits) > 6 or not re.fullmatch(r"[0-9a-fA-F]+", digits):
+                    raise ValueError("invalid Unicode escape in content_noencode")
+                codepoint = int(digits, 16)
+                if codepoint > 0x10FFFF:
+                    raise ValueError("Unicode escape is out of range in content_noencode")
+                chars.append(chr(codepoint))
+                index = end + 1
+                continue
+            digits = raw_html[index + 1 : index + 5]
+            if len(digits) != 4 or not re.fullmatch(r"[0-9a-fA-F]{4}", digits):
+                raise ValueError("invalid Unicode escape in content_noencode")
+            chars.append(chr(int(digits, 16)))
+            index += 5
+            continue
+        chars.append(escape_chars.get(escaped, escaped))
+        index += 1
+    raise ValueError("unterminated content_noencode string")
+
+
+def extract_content_noencode(raw_html: str) -> str | None:
+    pattern = re.compile(
+        r'''(?:(["'])content_noencode\1|\bcontent_noencode\b)\s*(?::|=)\s*(["'])''',
+        re.I,
+    )
+    found = False
+    error: ValueError | None = None
+    for match in pattern.finditer(raw_html):
+        found = True
+        try:
+            content, _end = decode_js_string(raw_html, match.end(), match.group(2))
+        except ValueError as exc:
+            error = exc
+            continue
+        if content.strip():
+            return content.strip()
+    if found:
+        raise error or ValueError("content_noencode is empty")
+    return None
+
+
 def find_article_html(raw_html: str) -> str:
     match = re.search(r'<div\b[^>]*id=["\']js_content["\'][^>]*>', raw_html, re.I)
-    if not match:
-        body = re.search(r"<body[^>]*>(.*?)</body>", raw_html, re.S | re.I)
-        return body.group(1).strip() if body else raw_html
-
-    start = match.start()
-    depth = 0
-    for token in re.finditer(r"</?div\b[^>]*>", raw_html[start:], re.I):
-        tag = token.group(0)
-        if tag.startswith("</"):
-            depth -= 1
+    article_html = ""
+    if match:
+        start = match.start()
+        depth = 0
+        for token in re.finditer(r"</?div\b[^>]*>", raw_html[start:], re.I):
+            tag = token.group(0)
+            if tag.startswith("</"):
+                depth -= 1
+            else:
+                depth += 1
+            if depth == 0:
+                end = start + token.end()
+                article_html = raw_html[start:end].strip()
+                break
         else:
-            depth += 1
-        if depth == 0:
-            end = start + token.end()
-            return raw_html[start:end].strip()
-    return raw_html[start:].strip()
+            article_html = raw_html[start:].strip()
+
+        visible_text = strip_tags(article_html)
+        visible_media = re.search(r"<(?:img|video|audio|iframe|svg|canvas|mp-[\w-]+)\b", article_html, re.I)
+        if visible_text or visible_media:
+            return article_html
+
+    embedded_content = extract_content_noencode(raw_html)
+    if embedded_content is not None:
+        return embedded_content
+    if article_html:
+        return article_html
+    body = re.search(r"<body[^>]*>(.*?)</body>", raw_html, re.S | re.I)
+    return body.group(1).strip() if body else raw_html
+
+
+def extract_item_show_type(raw_html: str) -> int:
+    patterns = [
+        r"\bitem_show_type\b\s*:\s*['\"]?(\d+)",
+        r"['\"]item_show_type['\"]\s*:\s*['\"]?(\d+)",
+        r"\bitem_show_type\b\s*=\s*['\"]?(\d+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, raw_html, re.I)
+        if match:
+            return int(match.group(1))
+    return 0
+
+
+def article_content_type(raw_html: str) -> tuple[str, int]:
+    item_show_type = extract_item_show_type(raw_html)
+    return ("贴图" if item_show_type == 8 else "图文", item_show_type)
+
+
+def add_embedded_picture_fallback(raw_html: str, article_body: str, content_type: str) -> str:
+    if content_type != "贴图" or IMG_RE.search(article_body):
+        return article_body
+    urls: list[str] = []
+    for match in re.finditer(r"(?:cdn_url|cover_url)\s*['\"]?\s*:\s*['\"](https?://mmbiz\.qpic\.cn/[^'\"\\]+)", raw_html, re.I):
+        url = html.unescape(match.group(1))
+        if url not in urls:
+            urls.append(url)
+    if not urls:
+        return article_body
+    image_html = "\n".join(f'<img data-src="{html.escape(url, quote=True)}" alt="图片">' for url in urls)
+    return image_html + article_body
+
+
+def prefixed_article_title(title: str, content_type: str) -> str:
+    prefix = f"[{content_type}]"
+    title = re.sub(r"^\[(?:图文|贴图)\]\s*", "", str(title or "")).strip()
+    return f"{prefix}{title or 'untitled'}"
 
 
 def remove_scripts_styles(value: str) -> str:
@@ -662,6 +798,21 @@ def html_to_markdown(value: str) -> str:
     value = re.sub(r"[ \t\r\f\v]+", " ", value)
     value = re.sub(r"\n{3,}", "\n\n", value)
     return value.strip()
+
+
+def article_html_to_markdown(value: str, content_type: str) -> str:
+    if content_type != "贴图":
+        return html_to_markdown(value)
+    image_html = "\n".join(match.group(0) for match in IMG_RE.finditer(value))
+    content_html = IMG_RE.sub("", value)
+    image_markdown = html_to_markdown(image_html).strip()
+    content_markdown = html_to_markdown(content_html).strip()
+    sections: list[str] = []
+    if image_markdown:
+        sections.append("## 图片\n\n" + image_markdown)
+    if content_markdown:
+        sections.append("## 内容\n\n" + content_markdown)
+    return "\n\n".join(sections)
 
 
 def safe_name(value: str, max_len: int = 90) -> str:
@@ -2503,6 +2654,32 @@ def proxy_enhancer_logs(base: Path, hours: int = 24, limit: int = 80) -> dict[st
     }
 
 
+def proxy_enhancer_video_links(base: Path, hours: int = 24, limit: int = 100) -> dict[str, Any]:
+    path = auto_snapshot_root(base) / "video-links.jsonl"
+    hours = max(1, min(int(hours or 24), 24 * 30))
+    limit = max(1, min(int(limit or 100), 1000))
+    rows = parse_jsonl_tail(path, 10000)
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=hours)
+    recent: list[dict[str, Any]] = []
+    for row in rows:
+        captured_at = parse_time(str(row.get("captured_at") or ""))
+        if captured_at and captured_at.tzinfo is None:
+            captured_at = captured_at.replace(tzinfo=dt.timezone.utc)
+        if captured_at and captured_at < cutoff:
+            continue
+        recent.append(row)
+    return {
+        "ok": True,
+        "mode": "proxy-enhancer",
+        "log": str(path),
+        "exists": path.exists(),
+        "window_hours": hours,
+        "link_count": len(recent),
+        "links": recent[-limit:],
+        "scope": "Public channels.weixin.qq.com page URLs only; no video files or signed media credentials.",
+    }
+
+
 def proxy_enhancer_check_ingress(base: Path, port: int | None = None, minutes: int = 10) -> dict[str, Any]:
     status = status_proxy_enhancer(base, port)
     selected_port = status.get("port")
@@ -3308,7 +3485,10 @@ def download_one(url: str, base: Path, formats: set[str], download_assets: bool)
     cleaned = clean_url(url)
     raw = fetch_text(cleaned)
     meta = extract_meta(raw, cleaned)
+    content_type, item_show_type = article_content_type(raw)
+    meta["title"] = prefixed_article_title(meta.get("title", ""), content_type)
     article_body = find_article_html(raw)
+    article_body = add_embedded_picture_fallback(raw, article_body, content_type)
     article_body = remove_scripts_styles(article_body)
     content_hash = hashlib.sha256(article_body.encode("utf-8")).hexdigest()
     article_id = hashlib.sha256((meta["canonical_url"] + content_hash).encode("utf-8")).hexdigest()[:16]
@@ -3318,7 +3498,7 @@ def download_one(url: str, base: Path, formats: set[str], download_assets: bool)
     article_dir.mkdir(parents=True, exist_ok=True)
 
     normalized_html, assets = localize_assets(article_body, assets_dir, download_assets)
-    markdown = html_to_markdown(normalized_html)
+    markdown = article_html_to_markdown(normalized_html, content_type)
     text = strip_tags(normalized_html)
 
     full_meta: dict[str, Any] = {
@@ -3326,6 +3506,8 @@ def download_one(url: str, base: Path, formats: set[str], download_assets: bool)
         "article_id": article_id,
         "downloaded_at": utc_now(),
         "content_hash": content_hash,
+        "content_type": content_type,
+        "item_show_type": item_show_type,
         "assets": assets,
     }
 
@@ -3367,6 +3549,8 @@ def markdown_frontmatter(meta: dict[str, Any], seq: str, image_dir: str) -> str:
         "source_url": meta.get("source_url", ""),
         "downloaded_at": meta.get("downloaded_at", ""),
         "image_dir": image_dir,
+        "content_type": meta.get("content_type", ""),
+        "item_show_type": meta.get("item_show_type", ""),
         "read_count": meta.get("read_count", ""),
         "like_count": meta.get("like_count", ""),
     }
@@ -3387,11 +3571,17 @@ def download_one_markdown_only(
     cleaned = clean_url(url)
     raw = fetch_text(cleaned)
     meta = extract_meta(raw, cleaned)
+    content_type, item_show_type = article_content_type(raw)
+    title_source = meta.get("title", "")
+    if not title_source or title_source.strip().lower() == "untitled":
+        title_source = filename_stem or ""
+    meta["title"] = prefixed_article_title(title_source, content_type)
     article_body = remove_scripts_styles(find_article_html(raw))
+    article_body = add_embedded_picture_fallback(raw, article_body, content_type)
     content_hash = hashlib.sha256(article_body.encode("utf-8")).hexdigest()
     article_id = hashlib.sha256((meta["canonical_url"] + content_hash).encode("utf-8")).hexdigest()[:16]
     if filename_stem:
-        safe_stem = safe_name(filename_stem, 90)
+        safe_stem = safe_name(prefixed_article_title(filename_stem, content_type), 90)
         article_rel = f"articles/{safe_stem}.md"
         image_rel = f"images/{safe_stem}"
     else:
@@ -3406,11 +3596,13 @@ def download_one_markdown_only(
             "article_id": article_id,
             "downloaded_at": utc_now(),
             "content_hash": content_hash,
+            "content_type": content_type,
+            "item_show_type": item_show_type,
         },
         seq,
-        f"../images/{seq}",
+        f"../{image_rel}",
     )
-    markdown += html_to_markdown(normalized_html).strip() + "\n"
+    markdown += article_html_to_markdown(normalized_html, content_type).strip() + "\n"
     article_path.parent.mkdir(parents=True, exist_ok=True)
     article_path.write_text(markdown, encoding="utf-8")
     image_count = len([asset for asset in assets if asset.get("local_path")])
@@ -3424,6 +3616,8 @@ def download_one_markdown_only(
         "markdown_path": article_rel,
         "image_dir": image_rel,
         "image_count": image_count,
+        "content_type": content_type,
+        "item_show_type": item_show_type,
         "read_count": meta.get("read_count", ""),
         "like_count": meta.get("like_count", ""),
         "article_context": extract_wechat_article_context(raw, cleaned),
@@ -3436,7 +3630,7 @@ def download_one_markdown_only(
 
 def write_markdown_only_index(output_dir: Path, rows: list[dict[str, Any]]) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
-    fields = ["seq", "article_id", "title", "account", "source_url", "markdown_path", "image_dir", "image_count", "read_count", "like_count", "status", "error"]
+    fields = ["seq", "article_id", "title", "account", "source_url", "markdown_path", "image_dir", "image_count", "content_type", "item_show_type", "read_count", "like_count", "status", "error"]
     with (output_dir / "index.csv").open("w", encoding="utf-8", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=fields)
         writer.writeheader()
@@ -4023,6 +4217,13 @@ def command_proxy_enhancer_check_ingress(args: argparse.Namespace) -> int:
 def command_proxy_enhancer_logs(args: argparse.Namespace) -> int:
     base = runtime_dir(args.runtime_dir)
     result = proxy_enhancer_logs(base, args.hours, args.limit)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def command_proxy_enhancer_video_links(args: argparse.Namespace) -> int:
+    base = runtime_dir(args.runtime_dir)
+    result = proxy_enhancer_video_links(base, args.hours, args.limit)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 
@@ -5752,6 +5953,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--hours", type=int, default=24, help="Recent window to inspect, capped at 24 hours")
     p.add_argument("--limit", type=int, default=80, help="Maximum events to print")
     p.set_defaults(func=command_proxy_enhancer_logs)
+
+    p = sub.add_parser("proxy-enhancer-video-links", help="Show captured public WeChat Channels page URLs")
+    p.add_argument("--runtime-dir", default=argparse.SUPPRESS, help="Override runtime directory")
+    p.add_argument("--hours", type=int, default=24, help="Recent window to inspect")
+    p.add_argument("--limit", type=int, default=100, help="Maximum links to print")
+    p.set_defaults(func=command_proxy_enhancer_video_links)
 
     p = sub.add_parser("proxy-enhancer-route-help", help="Show routing facts for the active random-port enhancer")
     p.add_argument("--runtime-dir", default=argparse.SUPPRESS, help="Override runtime directory")

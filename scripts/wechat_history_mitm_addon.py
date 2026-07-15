@@ -580,6 +580,72 @@ def safe_path_for_log(url: str) -> str:
     return parsed.path or "/"
 
 
+def sanitize_channels_url(url: str) -> str:
+    value = html.unescape(str(url or "")).replace(r"\/", "/").strip(" \t\r\n\"'<>),]")
+    parsed = urllib.parse.urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or parsed.netloc.lower() != "channels.weixin.qq.com":
+        return ""
+    path = parsed.path or "/"
+    if path != "/" and not path.startswith(("/web/pages/", "/platform/", "/pages/")):
+        return ""
+    if re.search(r"\.(?:js|css|png|jpe?g|gif|webp|svg|ico|woff2?|map)$", path, re.I):
+        return ""
+    safe_query: list[tuple[str, str]] = []
+    for key, item in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True):
+        lowered = key.lower()
+        if lowered in SENSITIVE_QUERY_KEYS or any(
+            marker in lowered for marker in ("token", "ticket", "cookie", "session", "auth", "uin", "exportkey")
+        ):
+            continue
+        safe_query.append((key, item))
+    return urllib.parse.urlunsplit(("https", "channels.weixin.qq.com", path, urllib.parse.urlencode(safe_query), ""))
+
+
+def extract_channels_urls(text: str) -> list[str]:
+    normalized = html.unescape(str(text or "")).replace(r"\/", "/")
+    candidates = re.findall(r"https?://channels\.weixin\.qq\.com/[^\s\"'<>]+", normalized, re.I)
+    result: list[str] = []
+    for candidate in candidates:
+        safe = sanitize_channels_url(candidate)
+        if safe and safe not in result:
+            result.append(safe)
+    return result
+
+
+def append_video_links(path: Path, urls: list[str], source_host: str, source_path: str, source_type: str) -> None:
+    if not urls:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    known: set[str] = set()
+    if path.exists():
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines()[-5000:]:
+                payload = json.loads(line)
+                if isinstance(payload, dict) and payload.get("url"):
+                    known.add(str(payload["url"]))
+        except Exception:
+            known = set()
+    with path.open("a", encoding="utf-8") as fh:
+        for url in urls:
+            if not url or url in known:
+                continue
+            fh.write(
+                json.dumps(
+                    {
+                        "captured_at": utc_now(),
+                        "url": url,
+                        "source_host": source_host,
+                        "source_path": source_path,
+                        "source_type": source_type,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+            known.add(url)
+
+
 def format_publish_time(value: Any) -> str:
     try:
         timestamp = int(value)
@@ -996,6 +1062,7 @@ class WeChatHistoryCapture:
                     "snapshot_root": root,
                     "index_path": Path(str(session.get("snapshot_index") or root / "index.jsonl")).expanduser(),
                     "network_jsonl": Path(str(session.get("network_jsonl") or root / "network.jsonl")).expanduser(),
+                    "video_links_jsonl": root / "video-links.jsonl",
                     "debug_log": root / "debug.jsonl",
                     "article_cache_dir": root / ".article-cache",
                 }
@@ -1357,6 +1424,26 @@ class WeChatHistoryCapture:
         content = flow.response.content or b""
         path = safe_path_for_log(request.url)
         content_type = flow.response.headers.get("content-type", "")
+        video_links: list[str] = []
+        if request.host == "channels.weixin.qq.com":
+            direct_url = sanitize_channels_url(request.url)
+            if direct_url:
+                video_links.append(direct_url)
+        if len(content) <= 4_000_000 and any(
+            marker in content_type.lower() for marker in ("html", "json", "javascript", "text/")
+        ):
+            try:
+                response_text = flow.response.get_text(strict=False)
+            except Exception:
+                response_text = ""
+            video_links.extend(extract_channels_urls(response_text))
+        append_video_links(
+            Path(context["video_links_jsonl"]),
+            list(dict.fromkeys(video_links)),
+            request.host,
+            path,
+            "direct-request" if request.host == "channels.weixin.qq.com" else "response-body",
+        )
         markers: list[str] = []
         article_page = is_article_page(request.host, path, content_type)
         if article_page:
