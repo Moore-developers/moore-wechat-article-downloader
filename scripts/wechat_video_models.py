@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Short-lived WeChat Channels video descriptors.
 
-This module ports the media-shape handling from res-downloader's qq.com plugin.
 Only public, non-sensitive descriptor fields should leave process memory.
 """
 
